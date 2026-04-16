@@ -114,7 +114,7 @@ class SuggestionControlsWidget extends WidgetType {
     if (this.suggestion.newText.length > 0) {
       const insertionPreview = document.createElement("span");
       insertionPreview.className = "ai-review-insert-preview";
-      insertionPreview.textContent = `+ ${truncateText(this.suggestion.newText, 60)}`;
+      insertionPreview.textContent = `+ ${this.suggestion.newText}`;
       container.appendChild(insertionPreview);
     }
 
@@ -150,12 +150,3 @@ class SuggestionControlsWidget extends WidgetType {
     return container;
   }
 }
-
-function truncateText(value: string, maxLength: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
-  }
-  return `${normalized.slice(0, maxLength - 1)}...`;
-}
-
