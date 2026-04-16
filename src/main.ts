@@ -284,8 +284,27 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   async onSuggestionAction(id: string, action: SuggestionAction): Promise<void> {
-    const text = action === "accept" ? "Accept" : "Reject";
-    new Notice(`${text} clicked for ${id}. Apply engine is next.`);
+    if (!this.currentReviewState || !this.activeNotePath) {
+      new Notice("No review state loaded for this note.");
+      return;
+    }
+
+    const suggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+    if (!suggestion) {
+      new Notice(`Suggestion ${id} was not found.`);
+      return;
+    }
+    if (suggestion.status !== "pending") {
+      new Notice(`Suggestion ${id} is already ${suggestion.status}.`);
+      return;
+    }
+
+    if (action === "reject") {
+      await this.markSuggestionRejected(suggestion);
+      return;
+    }
+
+    await this.applySingleSuggestion(suggestion);
   }
 
   private refreshActiveEditorDecorations(): void {
@@ -298,8 +317,134 @@ export default class AiReviewPlugin extends Plugin {
       effects: [refreshReviewEffect.of(undefined)]
     });
   }
+
+  private async markSuggestionRejected(suggestion: Suggestion): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const fromStatus = suggestion.status;
+    suggestion.status = "rejected";
+    suggestion.decidedAt = now;
+    suggestion.decidedBy = this.settings.reviewerName || undefined;
+    this.currentReviewState.updatedAt = now;
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "reject",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      fromStatus,
+      toStatus: "rejected",
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash
+    });
+    this.refreshActiveEditorDecorations();
+    new Notice(`Rejected suggestion ${suggestion.id}.`);
+  }
+
+  private async applySingleSuggestion(suggestion: Suggestion): Promise<void> {
+    const file = this.getActiveMarkdownFile();
+    if (!file || !this.currentReviewState || !this.activeNotePath) {
+      new Notice("No active markdown file.");
+      return;
+    }
+
+    const currentText = await this.app.vault.cachedRead(file);
+    const result = applySuggestionsDeterministically(currentText, [suggestion]);
+    const now = new Date().toISOString();
+
+    if (result.conflictedIds.has(suggestion.id)) {
+      const fromStatus = suggestion.status;
+      suggestion.status = "conflict";
+      suggestion.decidedAt = now;
+      suggestion.decidedBy = this.settings.reviewerName || undefined;
+      this.currentReviewState.updatedAt = now;
+      const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+      await this.persistence.appendAuditEvent({
+        eventType: "conflict",
+        notePath: this.activeNotePath,
+        reviewFile,
+        timestamp: now,
+        reviewer: this.settings.reviewerName || undefined,
+        suggestionId: suggestion.id,
+        fromStatus,
+        toStatus: "conflict",
+        baseHash: this.currentReviewState.baseHash,
+        currentHash: this.currentReviewState.currentHash
+      });
+      this.refreshActiveEditorDecorations();
+      new Notice(`Conflict for ${suggestion.id}. Expected text did not match current note.`);
+      return;
+    }
+
+    if (!result.appliedIds.has(suggestion.id)) {
+      new Notice(`Suggestion ${suggestion.id} was not applied.`);
+      return;
+    }
+
+    await this.app.vault.modify(file, result.nextText);
+
+    const fromStatus = suggestion.status;
+    suggestion.status = "accepted";
+    suggestion.decidedAt = now;
+    suggestion.decidedBy = this.settings.reviewerName || undefined;
+    this.currentReviewState.currentHash = sha256(result.nextText);
+    this.currentReviewState.updatedAt = now;
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "accept",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      fromStatus,
+      toStatus: "accepted",
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash
+    });
+    this.refreshActiveEditorDecorations();
+    new Notice(`Accepted suggestion ${suggestion.id}.`);
+  }
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function applySuggestionsDeterministically(
+  content: string,
+  suggestions: Suggestion[]
+): { nextText: string; appliedIds: Set<string>; conflictedIds: Set<string> } {
+  const sorted = [...suggestions].sort((a, b) => {
+    if (a.start !== b.start) {
+      return b.start - a.start;
+    }
+    return b.end - a.end;
+  });
+
+  let working = content;
+  const appliedIds = new Set<string>();
+  const conflictedIds = new Set<string>();
+
+  for (const suggestion of sorted) {
+    if (suggestion.start < 0 || suggestion.end < suggestion.start || suggestion.end > working.length) {
+      conflictedIds.add(suggestion.id);
+      continue;
+    }
+    const found = working.slice(suggestion.start, suggestion.end);
+    if (found !== suggestion.expectedOldText) {
+      conflictedIds.add(suggestion.id);
+      continue;
+    }
+    working =
+      working.slice(0, suggestion.start) + suggestion.newText + working.slice(suggestion.end);
+    appliedIds.add(suggestion.id);
+  }
+
+  return { nextText: working, appliedIds, conflictedIds };
 }
