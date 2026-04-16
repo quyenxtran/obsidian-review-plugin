@@ -29,6 +29,7 @@ export default class AiReviewPlugin extends Plugin {
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
   private readonly launchedWatcherPids = new Map<string, number>();
+  private lastSurfacedSuggestionId: string | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -73,6 +74,14 @@ export default class AiReviewPlugin extends Plugin {
       name: "AI Review: Next suggestion",
       callback: () => {
         this.moveSuggestionSelection(1);
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-open-current",
+      name: "AI Review: Open current suggestion",
+      callback: async () => {
+        await this.openCurrentSuggestionModal();
       }
     });
 
@@ -506,6 +515,7 @@ export default class AiReviewPlugin extends Plugin {
     this.selectedSuggestionId =
       this.currentReviewState?.suggestions.find((item) => item.status === "pending")?.id ?? null;
     this.refreshActiveEditorDecorations();
+    this.maybeSurfacePendingSuggestion();
   }
 
   private async ensureReviewStateForNote(
@@ -764,6 +774,84 @@ export default class AiReviewPlugin extends Plugin {
     });
   }
 
+  private async openCurrentSuggestionModal(): Promise<void> {
+    const suggestion =
+      this.getCurrentPendingSuggestion() ??
+      this.currentReviewState?.suggestions.find((item) => item.status === "conflict") ??
+      null;
+
+    if (!suggestion) {
+      new Notice("No pending or conflicted suggestion is available.");
+      return;
+    }
+
+    await this.openSuggestionReviewModal(suggestion.id);
+  }
+
+  private maybeSurfacePendingSuggestion(): void {
+    const suggestion =
+      this.getCurrentPendingSuggestion() ??
+      this.currentReviewState?.suggestions.find((item) => item.status === "conflict") ??
+      null;
+
+    if (!suggestion) {
+      this.lastSurfacedSuggestionId = null;
+      return;
+    }
+
+    if (this.lastSurfacedSuggestionId === suggestion.id) {
+      return;
+    }
+
+    this.lastSurfacedSuggestionId = suggestion.id;
+    window.setTimeout(() => {
+      void this.openSuggestionReviewModal(suggestion.id);
+    }, 100);
+  }
+
+  private async openSuggestionReviewModal(id: string): Promise<void> {
+    if (!this.currentReviewState) {
+      return;
+    }
+
+    const suggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+    if (!suggestion) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      new ReviewSuggestionModal(
+        this.app,
+        suggestion,
+        async (decision) => {
+          if (!this.currentReviewState) {
+            resolve();
+            return;
+          }
+          const liveSuggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+          if (!liveSuggestion) {
+            resolve();
+            return;
+          }
+
+          if (decision.editedText !== liveSuggestion.newText) {
+            liveSuggestion.newText = decision.editedText;
+            this.currentReviewState.updatedAt = new Date().toISOString();
+            await this.persistence.writeReviewState(this.currentReviewState);
+          }
+
+          if (decision.action === "accept") {
+            await this.onSuggestionAction(id, "accept");
+          } else if (decision.action === "reject") {
+            await this.onSuggestionAction(id, "reject");
+          }
+          resolve();
+        },
+        () => resolve()
+      ).open();
+    });
+  }
+
   private async importCodexResponsesForActiveFile(): Promise<void> {
     const file = this.getActiveMarkdownFile();
     if (!file) {
@@ -865,6 +953,10 @@ export default class AiReviewPlugin extends Plugin {
     });
     await this.persistence.deleteFile(responseFile);
     this.jumpToSuggestion(placeholder);
+    if (placeholder.status === "pending" || placeholder.status === "conflict") {
+      this.lastSurfacedSuggestionId = placeholder.id;
+      void this.openSuggestionReviewModal(placeholder.id);
+    }
     return true;
   }
 
@@ -1575,6 +1667,80 @@ class EditSuggestionModal extends Modal {
 
   override onClose(): void {
     this.contentEl.empty();
+  }
+}
+
+class ReviewSuggestionModal extends Modal {
+  private handled = false;
+
+  constructor(
+    app: Plugin["app"],
+    private readonly suggestion: Suggestion,
+    private readonly onResolve: (decision: {
+      action: "accept" | "reject" | "cancel";
+      editedText: string;
+    }) => Promise<void> | void,
+    private readonly onCancelOnly: () => void
+  ) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    const { contentEl, modalEl } = this;
+    modalEl.addClass("ai-review-review-modal");
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Review suggestion" });
+
+    const status = contentEl.createEl("p", { cls: "ai-review-review-status" });
+    status.textContent = `Status: ${this.suggestion.status}`;
+
+    contentEl.createEl("h3", { text: "Current text" });
+    const original = contentEl.createEl("pre", { cls: "ai-review-review-original" });
+    original.textContent = this.suggestion.expectedOldText || "[empty selection]";
+
+    contentEl.createEl("h3", { text: "Suggested text" });
+    const textarea = contentEl.createEl("textarea", {
+      cls: "ai-review-review-textarea"
+    });
+    textarea.value = this.suggestion.newText;
+    textarea.rows = 12;
+
+    if (this.suggestion.rationale) {
+      const rationale = contentEl.createEl("p", { cls: "ai-review-review-rationale" });
+      rationale.textContent = `Rationale: ${this.suggestion.rationale}`;
+    }
+
+    const actions = contentEl.createDiv({ cls: "ai-review-review-actions" });
+    const cancelButton = actions.createEl("button", { text: "Cancel" });
+    cancelButton.onclick = () => {
+      this.handled = true;
+      void this.onResolve({ action: "cancel", editedText: textarea.value });
+      this.close();
+    };
+
+    const rejectButton = actions.createEl("button", { text: "Reject" });
+    rejectButton.onclick = () => {
+      this.handled = true;
+      void this.onResolve({ action: "reject", editedText: textarea.value });
+      this.close();
+    };
+
+    const acceptButton = actions.createEl("button", {
+      text: "Accept",
+      cls: "mod-cta"
+    });
+    acceptButton.onclick = () => {
+      this.handled = true;
+      void this.onResolve({ action: "accept", editedText: textarea.value });
+      this.close();
+    };
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
+    if (!this.handled) {
+      this.onCancelOnly();
+    }
   }
 }
 

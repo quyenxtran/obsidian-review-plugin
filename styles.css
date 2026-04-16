@@ -75,3 +75,33 @@
   gap: 0.5rem;
   margin-top: 0.75rem;
 }
+
+.ai-review-review-status,
+.ai-review-review-rationale {
+  color: var(--text-muted);
+  margin: 0.5rem 0 0.75rem;
+}
+
+.ai-review-review-original {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  font: inherit;
+  line-height: 1.45;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-review-review-textarea {
+  width: 100%;
+  min-height: 16rem;
+  resize: vertical;
+}
+
+.ai-review-review-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
