@@ -346,7 +346,6 @@ export default class AiReviewPlugin extends Plugin {
     return this.currentReviewState.suggestions.filter((suggestion) => {
       return (
         suggestion.status === "pending" ||
-        suggestion.status === "stale" ||
         suggestion.status === "conflict"
       );
     });
