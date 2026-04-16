@@ -707,14 +707,55 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private refreshActiveEditorDecorations(): void {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const cm = (view?.editor as unknown as { cm?: { dispatch: (spec: unknown) => void } }).cm;
+    const cm = this.getActiveCodeMirrorView();
     if (!cm) {
       return;
     }
     cm.dispatch({
       effects: [refreshReviewEffect.of(undefined)]
     });
+  }
+
+  private getActiveCodeMirrorView():
+    | { dispatch: (spec: unknown) => void }
+    | null {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      return null;
+    }
+
+    const editor = view.editor as unknown as {
+      cm?: { dispatch: (spec: unknown) => void };
+      cm6?: { dispatch: (spec: unknown) => void };
+      editor?: { cm?: { dispatch: (spec: unknown) => void }; cm6?: { dispatch: (spec: unknown) => void } };
+    };
+    const markdownView = view as unknown as {
+      editor?: { cm?: { dispatch: (spec: unknown) => void }; cm6?: { dispatch: (spec: unknown) => void } };
+      editorCm?: { dispatch: (spec: unknown) => void };
+      cm?: { dispatch: (spec: unknown) => void };
+      cm6?: { dispatch: (spec: unknown) => void };
+      currentMode?: {
+        editor?: {
+          cm?: { dispatch: (spec: unknown) => void };
+          cm6?: { dispatch: (spec: unknown) => void };
+        };
+      };
+    };
+
+    return (
+      editor.cm6 ??
+      editor.cm ??
+      editor.editor?.cm6 ??
+      editor.editor?.cm ??
+      markdownView.cm6 ??
+      markdownView.cm ??
+      markdownView.editorCm ??
+      markdownView.editor?.cm6 ??
+      markdownView.editor?.cm ??
+      markdownView.currentMode?.editor?.cm6 ??
+      markdownView.currentMode?.editor?.cm ??
+      null
+    );
   }
 
   private async openSuggestionEditModal(suggestion: Suggestion): Promise<string | null> {
