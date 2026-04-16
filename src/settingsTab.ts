@@ -26,50 +26,8 @@ export class AiReviewSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("OpenAI API key")
-      .setDesc("Stored in this plugin's local settings file and used for direct AI review generation.")
-      .addText((text) => {
-        text
-          .setPlaceholder("sk-...")
-          .setValue(this.plugin.settings.openAiApiKey)
-          .onChange(async (value) => {
-            this.plugin.settings.openAiApiKey = value.trim();
-            await this.plugin.saveSettings();
-          });
-        text.inputEl.type = "password";
-        return text;
-      });
-
-    new Setting(containerEl)
-      .setName("OpenAI Responses endpoint")
-      .setDesc("Override only if you are using a compatible gateway.")
-      .addText((text) =>
-        text
-          .setPlaceholder("https://api.openai.com/v1/responses")
-          .setValue(this.plugin.settings.openAiEndpoint)
-          .onChange(async (value) => {
-            this.plugin.settings.openAiEndpoint =
-              value.trim() || "https://api.openai.com/v1/responses";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("OpenAI model")
-      .setDesc("Model used to generate selection-level rewrite suggestions.")
-      .addText((text) =>
-        text
-          .setPlaceholder("gpt-5.4-mini")
-          .setValue(this.plugin.settings.openAiModel)
-          .onChange(async (value) => {
-            this.plugin.settings.openAiModel = value.trim() || "gpt-5.4-mini";
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
       .setName("Default AI edit instruction")
-      .setDesc("Used when you run the selection-based AI review command.")
+      .setDesc("Written into exported selection requests for terminal Codex to follow.")
       .addTextArea((text) =>
         text
           .setPlaceholder("Revise the selected text...")
@@ -91,6 +49,34 @@ export class AiReviewSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.reviewsFolder)
           .onChange(async (value) => {
             this.plugin.settings.reviewsFolder = value.trim() || ".obsidian/ai-review";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Request folder")
+      .setDesc("Vault-relative folder where selection requests are written for terminal Codex.")
+      .addText((text) =>
+        text
+          .setPlaceholder(".obsidian/ai-review/requests")
+          .setValue(this.plugin.settings.requestsFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.requestsFolder =
+              value.trim() || ".obsidian/ai-review/requests";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Response folder")
+      .setDesc("Vault-relative folder where terminal Codex writes completed response JSON files.")
+      .addText((text) =>
+        text
+          .setPlaceholder(".obsidian/ai-review/responses")
+          .setValue(this.plugin.settings.responsesFolder)
+          .onChange(async (value) => {
+            this.plugin.settings.responsesFolder =
+              value.trim() || ".obsidian/ai-review/responses";
             await this.plugin.saveSettings();
           })
       );

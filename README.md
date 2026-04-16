@@ -1,7 +1,7 @@
 # AI Review Plugin for Obsidian
 
 DOCX-style review workflow for AI edits in markdown notes:
-- import AI suggestions from JSON
+- request Codex suggestions from selected text via request/response JSON files
 - review inline insert/delete markers
 - accept/reject per suggestion
 - navigate suggestions with commands
@@ -10,11 +10,14 @@ DOCX-style review workflow for AI edits in markdown notes:
 ## Scope (v1)
 - Desktop Obsidian only
 - Single active note review at a time
-- Import-only backend (generate JSON in Codex or another tool, then import)
+- Terminal-Codex workflow via request/response files
+- Legacy JSON import still available for backfill and debugging
 
 ## Commands
 - `AI Review: Show status`
-- `AI Review: Import suggestions from JSON`
+- `AI Review: Request Codex suggestion for selection`
+- `AI Review: Check for Codex responses`
+- `AI Review: Import suggestions from JSON (legacy)`
 - `AI Review: Next suggestion`
 - `AI Review: Previous suggestion`
 - `AI Review: Accept current suggestion`
@@ -25,10 +28,62 @@ DOCX-style review workflow for AI edits in markdown notes:
 ## Data Files
 - Review state sidecars:
   - `.obsidian/ai-review/<sha256(notePath)>.review.json`
+- Selection requests:
+  - `.obsidian/ai-review/requests/<requestId>.request.json`
+- Completed Codex responses:
+  - `.obsidian/ai-review/responses/<requestId>.response.json`
 - Audit log (append-only NDJSON):
   - `.obsidian/ai-review/review-log.ndjson`
 
 Both paths are configurable in plugin settings.
+
+## Terminal Codex Flow
+1. In Obsidian, select text in a note.
+2. Run `AI Review: Request Codex suggestion for selection`.
+3. The plugin writes a request JSON file into `.obsidian/ai-review/requests/`.
+4. In terminal Codex, read that request and write a matching response JSON into `.obsidian/ai-review/responses/`.
+5. The plugin polls for responses and converts them into inline pending suggestions automatically.
+6. Accept, reject, or edit the inline suggestion in Obsidian.
+
+## Request Schema (v1)
+
+```json
+{
+  "schemaVersion": 1,
+  "requestId": "req-123",
+  "notePath": "Drafts/Main Essay.md",
+  "baseHash": "sha256-of-note-text-at-request-time",
+  "createdAt": "2026-04-16T12:00:00.000Z",
+  "instruction": "Revise the selected text for clarity...",
+  "contextBefore": "prior context",
+  "contextAfter": "following context",
+  "selection": {
+    "start": 120,
+    "end": 152,
+    "text": "old phrase here"
+  }
+}
+```
+
+## Response Schema (v1)
+
+```json
+{
+  "schemaVersion": 1,
+  "requestId": "req-123",
+  "notePath": "Drafts/Main Essay.md",
+  "baseHash": "sha256-of-note-text-at-request-time",
+  "generator": {
+    "source": "codex",
+    "model": "gpt-5.4",
+    "generatedAt": "2026-04-16T12:01:00.000Z"
+  },
+  "suggestion": {
+    "newText": "new phrase here",
+    "rationale": "tighten wording"
+  }
+}
+```
 
 ## JSON Import Schema (v1)
 
@@ -76,6 +131,10 @@ Both paths are configurable in plugin settings.
 Generated output: `main.js` in repo root.
 
 ## Troubleshooting
+- "Created Codex request" but nothing appears inline:
+  - make sure terminal Codex wrote a valid response JSON into the configured responses folder.
+- Response imported as `conflict`:
+  - the selected span changed before the response arrived; use `Resolve` or regenerate from the latest text.
 - "Payload is for X, active note is Y":
   - open the matching note and re-run import.
 - "Marked stale (hash mismatch)":
@@ -85,6 +144,5 @@ Generated output: `main.js` in repo root.
 
 ## Limitations
 - No mobile support in v1.
-- No direct model API calls from plugin in v1.
+- No direct model API calls in the primary workflow; generation is delegated to terminal Codex.
 - Offsets are UTF-16 character offsets and must match Obsidian editor text.
-

@@ -1,7 +1,14 @@
-export type ReviewStatus = "pending" | "accepted" | "rejected" | "stale" | "conflict";
+export type ReviewStatus =
+  | "requested"
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "stale"
+  | "conflict";
 
 export interface Suggestion {
   id: string;
+  requestId?: string;
   start: number;
   end: number;
   expectedOldText: string;
@@ -17,6 +24,34 @@ export interface ReviewGeneratorInfo {
   source: "codex";
   model?: string;
   generatedAt: string;
+}
+
+export interface CodexSelectionRequest {
+  schemaVersion: 1;
+  requestId: string;
+  notePath: string;
+  baseHash: string;
+  createdAt: string;
+  instruction: string;
+  contextBefore?: string;
+  contextAfter?: string;
+  selection: {
+    start: number;
+    end: number;
+    text: string;
+  };
+}
+
+export interface CodexSelectionResponse {
+  schemaVersion: 1;
+  requestId: string;
+  notePath: string;
+  baseHash: string;
+  generator: ReviewGeneratorInfo;
+  suggestion: {
+    newText: string;
+    rationale?: string;
+  };
 }
 
 export interface ReviewPayload {
@@ -38,6 +73,7 @@ export interface ReviewState {
 }
 
 export type ReviewActionType =
+  | "request"
   | "generate"
   | "import"
   | "edit"
@@ -68,21 +104,19 @@ export interface AuditEvent {
 
 export interface AiReviewSettings {
   reviewsFolder: string;
+  requestsFolder: string;
+  responsesFolder: string;
   auditLogPath: string;
   reviewerName: string;
-  openAiApiKey: string;
-  openAiEndpoint: string;
-  openAiModel: string;
   defaultEditInstruction: string;
 }
 
 export const DEFAULT_SETTINGS: AiReviewSettings = {
   reviewsFolder: ".obsidian/ai-review",
+  requestsFolder: ".obsidian/ai-review/requests",
+  responsesFolder: ".obsidian/ai-review/responses",
   auditLogPath: ".obsidian/ai-review/review-log.ndjson",
   reviewerName: "",
-  openAiApiKey: "",
-  openAiEndpoint: "https://api.openai.com/v1/responses",
-  openAiModel: "gpt-5.4-mini",
   defaultEditInstruction:
     "Revise the selected text for clarity, grammar, technical precision, and concision. Preserve meaning, markdown, citations, equations, and notation. Return only the revised replacement text with no commentary or quotation marks."
 };

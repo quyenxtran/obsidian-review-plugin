@@ -1,4 +1,4 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath, requestUrl } from "obsidian";
+import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { MapMode, type ChangeDesc } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
 import { sha256 } from "./hash";
@@ -12,6 +12,8 @@ import { AiReviewSettingTab } from "./settingsTab";
 import {
   DEFAULT_SETTINGS,
   type AiReviewSettings,
+  type CodexSelectionRequest,
+  type CodexSelectionResponse,
   type ReviewPayload,
   type ReviewState,
   type Suggestion
@@ -42,9 +44,17 @@ export default class AiReviewPlugin extends Plugin {
 
     this.addCommand({
       id: "ai-review-suggest-selection",
-      name: "AI Review: Suggest revision for selection",
+      name: "AI Review: Request Codex suggestion for selection",
       callback: async () => {
-        await this.generateSuggestionForSelection();
+        await this.createSelectionRequest();
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-check-responses",
+      name: "AI Review: Check for Codex responses",
+      callback: async () => {
+        await this.importCodexResponsesForActiveFile();
       }
     });
 
@@ -123,6 +133,11 @@ export default class AiReviewPlugin extends Plugin {
       this.app.workspace.on("file-open", async () => {
         await this.loadStateForActiveFile();
       })
+    );
+    this.registerInterval(
+      window.setInterval(() => {
+        void this.importCodexResponsesForActiveFile();
+      }, 4000)
     );
     await this.loadStateForActiveFile();
   }
@@ -330,16 +345,10 @@ export default class AiReviewPlugin extends Plugin {
     });
   }
 
-  private async generateSuggestionForSelection(): Promise<void> {
+  private async createSelectionRequest(): Promise<void> {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view?.file) {
-      new Notice("Open a markdown note before generating AI suggestions.");
-      return;
-    }
-
-    const apiKey = this.settings.openAiApiKey.trim();
-    if (!apiKey) {
-      new Notice("Set an OpenAI API key in AI Review settings first.");
+      new Notice("Open a markdown note before creating a Codex request.");
       return;
     }
 
@@ -368,33 +377,9 @@ export default class AiReviewPlugin extends Plugin {
       return;
     }
 
-    const prompt = buildRevisionPrompt(
-      selectedText,
-      noteText.slice(Math.max(0, selectionStart - 500), selectionStart),
-      noteText.slice(selectionEnd, Math.min(noteText.length, selectionEnd + 500)),
-      this.settings.defaultEditInstruction
-    );
-
-    new Notice("Generating AI suggestion...");
-
-    let suggestedText: string;
-    try {
-      suggestedText = await this.requestAiSuggestion(prompt);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "AI request failed.";
-      new Notice(message);
-      return;
-    }
-
-    suggestedText = normalizeAiOutput(suggestedText);
-    if (!suggestedText) {
-      new Notice("AI returned an empty suggestion.");
-      return;
-    }
-    if (suggestedText === selectedText) {
-      new Notice("AI returned no change for the selected text.");
-      return;
-    }
+    const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const contextBefore = noteText.slice(Math.max(0, selectionStart - 500), selectionStart);
+    const contextAfter = noteText.slice(selectionEnd, Math.min(noteText.length, selectionEnd + 500));
 
     const replacedCount = await this.replaceOverlappingSuggestions(
       state,
@@ -403,13 +388,29 @@ export default class AiReviewPlugin extends Plugin {
       now
     );
     const suggestion: Suggestion = {
-      id: `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      id: requestId,
+      requestId,
       start: selectionStart,
       end: selectionEnd,
       expectedOldText: selectedText,
-      newText: suggestedText,
-      status: "pending",
+      newText: "",
+      status: "requested",
       createdAt: now
+    };
+    const request: CodexSelectionRequest = {
+      schemaVersion: 1,
+      requestId,
+      notePath,
+      baseHash: currentHash,
+      createdAt: now,
+      instruction: this.settings.defaultEditInstruction,
+      contextBefore,
+      contextAfter,
+      selection: {
+        start: selectionStart,
+        end: selectionEnd,
+        text: selectedText
+      }
     };
 
     state.suggestions.push(suggestion);
@@ -421,23 +422,23 @@ export default class AiReviewPlugin extends Plugin {
     this.currentReviewState = state;
     this.activeNotePath = notePath;
     this.selectedSuggestionId = suggestion.id;
+    const requestFile = await this.persistence.writeSelectionRequest(request);
     const reviewFile = await this.persistence.writeReviewState(state);
     await this.persistence.appendAuditEvent({
-      eventType: "generate",
+      eventType: "request",
       notePath,
       reviewFile,
       timestamp: now,
       reviewer: this.settings.reviewerName || undefined,
       suggestionId: suggestion.id,
-      toStatus: "pending",
+      toStatus: "requested",
       baseHash: state.baseHash,
-      currentHash: state.currentHash,
-      payloadGenerator: this.settings.openAiModel.trim() || "openai"
+      currentHash: state.currentHash
     });
-    this.jumpToSuggestion(suggestion);
     this.refreshActiveEditorDecorations();
     const suffix = replacedCount > 0 ? ` Replaced ${replacedCount} overlapping suggestion(s).` : "";
-    new Notice(`Generated AI suggestion for the current selection.${suffix}`);
+    new Notice(`Created Codex request.${suffix} Response expected in ${this.settings.responsesFolder}.`);
+    console.info("AI Review request file:", requestFile);
   }
 
   async loadStateForActiveFile(): Promise<void> {
@@ -512,14 +513,14 @@ export default class AiReviewPlugin extends Plugin {
       new Notice(`Suggestion ${id} was not found.`);
       return;
     }
-    if (suggestion.status !== "pending") {
-      new Notice(`Suggestion ${id} is already ${suggestion.status}.`);
+    if (action === "reject" && (suggestion.status === "pending" || suggestion.status === "conflict" || suggestion.status === "requested")) {
+      await this.markSuggestionRejected(suggestion);
+      this.selectFallbackSuggestion();
       return;
     }
 
-    if (action === "reject") {
-      await this.markSuggestionRejected(suggestion);
-      this.selectFallbackSuggestion();
+    if (suggestion.status !== "pending") {
+      new Notice(`Suggestion ${id} is already ${suggestion.status}.`);
       return;
     }
 
@@ -672,38 +673,108 @@ export default class AiReviewPlugin extends Plugin {
     });
   }
 
-  private async requestAiSuggestion(prompt: string): Promise<string> {
-    const endpoint = this.settings.openAiEndpoint.trim() || "https://api.openai.com/v1/responses";
-    const model = this.settings.openAiModel.trim() || "gpt-5.4-mini";
+  private async importCodexResponsesForActiveFile(): Promise<void> {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      return;
+    }
 
-    const response = await requestUrl({
-      url: endpoint,
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.settings.openAiApiKey.trim()}`,
-        "X-Client-Request-Id": `ai-review-${Date.now()}`
-      },
-      body: JSON.stringify({
-        model,
-        instructions:
-          "You are revising user-selected prose inside an Obsidian note. Return only replacement text for the selected span.",
-        input: prompt
-      })
+    const notePath = normalizePath(file.path);
+    const state = await this.ensureReviewStateForNote(notePath, sha256(await this.app.vault.cachedRead(file)));
+    const responseFiles = await this.persistence.listSelectionResponses();
+    let importedCount = 0;
+
+    for (const responseFile of responseFiles) {
+      let response: CodexSelectionResponse;
+      try {
+        response = parseCodexSelectionResponse(
+          await this.persistence.readSelectionResponse(responseFile)
+        );
+      } catch {
+        continue;
+      }
+
+      if (normalizePath(response.notePath) !== notePath) {
+        continue;
+      }
+
+      const imported = await this.applyCodexResponse(state, response, responseFile);
+      if (imported) {
+        importedCount += 1;
+      }
+    }
+
+    if (importedCount > 0) {
+      this.refreshActiveEditorDecorations();
+      new Notice(`Imported ${importedCount} Codex response${importedCount === 1 ? "" : "s"}.`);
+    }
+  }
+
+  private async applyCodexResponse(
+    state: ReviewState,
+    response: CodexSelectionResponse,
+    responseFile: string
+  ): Promise<boolean> {
+    if (!this.activeNotePath) {
+      return false;
+    }
+
+    const placeholder = state.suggestions.find(
+      (suggestion) => suggestion.requestId === response.requestId
+    );
+    if (!placeholder) {
+      return false;
+    }
+
+    const noteFile = this.getActiveMarkdownFile();
+    if (!noteFile) {
+      return false;
+    }
+    const noteText = await this.app.vault.cachedRead(noteFile);
+    const currentHash = sha256(noteText);
+    const now = new Date().toISOString();
+
+    placeholder.rationale = response.suggestion.rationale;
+    placeholder.newText = normalizeAiOutput(response.suggestion.newText);
+
+    if (!placeholder.newText) {
+      await this.persistence.deleteFile(responseFile);
+      return false;
+    }
+
+    const currentTarget = noteText.slice(placeholder.start, placeholder.end);
+    if (placeholder.status === "requested") {
+      if (currentTarget === placeholder.expectedOldText && currentHash === response.baseHash) {
+        placeholder.status = "pending";
+        placeholder.decidedAt = undefined;
+        placeholder.decidedBy = undefined;
+      } else {
+        placeholder.status = "conflict";
+        placeholder.decidedAt = now;
+        placeholder.decidedBy = this.settings.reviewerName || undefined;
+      }
+    }
+
+    state.currentHash = currentHash;
+    state.updatedAt = now;
+    this.selectedSuggestionId = placeholder.status === "pending" ? placeholder.id : this.selectedSuggestionId;
+    const reviewFile = await this.persistence.writeReviewState(state);
+    await this.persistence.appendAuditEvent({
+      eventType: "generate",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: placeholder.id,
+      fromStatus: "requested",
+      toStatus: placeholder.status,
+      baseHash: state.baseHash,
+      currentHash: state.currentHash,
+      payloadGenerator: response.generator.model || response.generator.source
     });
-
-    if (response.status < 200 || response.status >= 300) {
-      const message = typeof response.text === "string" && response.text.trim()
-        ? response.text
-        : `OpenAI request failed with status ${response.status}.`;
-      throw new Error(message);
-    }
-
-    const outputText = extractResponseOutputText(response.json);
-    if (!outputText) {
-      throw new Error("OpenAI returned no text output.");
-    }
-    return outputText;
+    await this.persistence.deleteFile(responseFile);
+    this.jumpToSuggestion(placeholder);
+    return true;
   }
 
   private async replaceOverlappingSuggestions(
@@ -717,7 +788,11 @@ export default class AiReviewPlugin extends Plugin {
     }
 
     const overlapping = state.suggestions.filter((suggestion) => {
-      if (suggestion.status !== "pending" && suggestion.status !== "conflict") {
+      if (
+        suggestion.status !== "requested" &&
+        suggestion.status !== "pending" &&
+        suggestion.status !== "conflict"
+      ) {
         return false;
       }
       return rangesOverlap(suggestion.start, suggestion.end, start, end);
@@ -1043,7 +1118,10 @@ export default class AiReviewPlugin extends Plugin {
 
     const conflicts: Suggestion[] = [];
     for (const suggestion of this.currentReviewState.suggestions) {
-      if (suggestion.id === accepted.id || suggestion.status !== "pending") {
+      if (
+        suggestion.id === accepted.id ||
+        (suggestion.status !== "pending" && suggestion.status !== "requested")
+      ) {
         continue;
       }
 
@@ -1076,7 +1154,7 @@ export default class AiReviewPlugin extends Plugin {
 
     const conflicts: Suggestion[] = [];
     for (const suggestion of this.currentReviewState.suggestions) {
-      if (suggestion.status !== "pending") {
+      if (suggestion.status !== "pending" && suggestion.status !== "requested") {
         continue;
       }
 
@@ -1209,23 +1287,6 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function buildRevisionPrompt(
-  selectedText: string,
-  contextBefore: string,
-  contextAfter: string,
-  instruction: string
-): string {
-  return [
-    instruction.trim(),
-    "Revise only the selected text so it fits the surrounding note.",
-    "Preserve citation markers, equations, units, markdown, and claim scope unless the selected text itself requires a minimal correction.",
-    "Return only the revised replacement text.",
-    `Context before:\n${contextBefore || "[none]"}`,
-    `Selected text:\n${selectedText}`,
-    `Context after:\n${contextAfter || "[none]"}`
-  ].join("\n\n");
-}
-
 function normalizeAiOutput(value: string): string {
   const trimmed = value.trim();
   if (
@@ -1237,39 +1298,47 @@ function normalizeAiOutput(value: string): string {
   return trimmed;
 }
 
-function extractResponseOutputText(value: unknown): string {
-  if (!isObject(value)) {
-    return "";
+function parseCodexSelectionResponse(raw: unknown): CodexSelectionResponse {
+  if (!isObject(raw)) {
+    throw new Error("Response must be an object.");
   }
-  if (typeof value.output_text === "string" && value.output_text.trim()) {
-    return value.output_text;
+  if (raw.schemaVersion !== 1) {
+    throw new Error("Unsupported response schemaVersion.");
   }
-
-  const output = value.output;
-  if (!Array.isArray(output)) {
-    return "";
+  if (typeof raw.requestId !== "string" || !raw.requestId.trim()) {
+    throw new Error("Response requestId is required.");
   }
-
-  const collected: string[] = [];
-  for (const item of output) {
-    if (!isObject(item)) {
-      continue;
-    }
-    const content = item.content;
-    if (!Array.isArray(content)) {
-      continue;
-    }
-    for (const part of content) {
-      if (!isObject(part)) {
-        continue;
-      }
-      if (typeof part.text === "string" && part.text.trim()) {
-        collected.push(part.text);
-      }
-    }
+  if (typeof raw.notePath !== "string" || !raw.notePath.trim()) {
+    throw new Error("Response notePath is required.");
+  }
+  if (typeof raw.baseHash !== "string" || !raw.baseHash.trim()) {
+    throw new Error("Response baseHash is required.");
+  }
+  if (!isObject(raw.generator) || raw.generator.source !== "codex") {
+    throw new Error("Response generator.source must be codex.");
+  }
+  if (typeof raw.generator.generatedAt !== "string" || !raw.generator.generatedAt.trim()) {
+    throw new Error("Response generator.generatedAt is required.");
+  }
+  if (!isObject(raw.suggestion) || typeof raw.suggestion.newText !== "string") {
+    throw new Error("Response suggestion.newText is required.");
   }
 
-  return collected.join("\n").trim();
+  return {
+    schemaVersion: 1,
+    requestId: raw.requestId,
+    notePath: raw.notePath,
+    baseHash: raw.baseHash,
+    generator: {
+      source: "codex",
+      model: typeof raw.generator.model === "string" ? raw.generator.model : undefined,
+      generatedAt: raw.generator.generatedAt
+    },
+    suggestion: {
+      newText: raw.suggestion.newText,
+      rationale: typeof raw.suggestion.rationale === "string" ? raw.suggestion.rationale : undefined
+    }
+  };
 }
 
 function applySuggestionsDeterministically(

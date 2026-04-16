@@ -1,6 +1,12 @@
 import { App, normalizePath } from "obsidian";
 import { sha256 } from "./hash";
-import type { AiReviewSettings, AuditEvent, ReviewState } from "./types";
+import type {
+  AiReviewSettings,
+  AuditEvent,
+  CodexSelectionRequest,
+  CodexSelectionResponse,
+  ReviewState
+} from "./types";
 
 export class ReviewPersistence {
   constructor(
@@ -13,6 +19,16 @@ export class ReviewPersistence {
     const noteHash = sha256(normalizePath(notePath));
     const fileName = `${noteHash}.review.json`;
     return normalizePath(`${settings.reviewsFolder}/${fileName}`);
+  }
+
+  getRequestFilePath(requestId: string): string {
+    const settings = this.getSettings();
+    return normalizePath(`${settings.requestsFolder}/${requestId}.request.json`);
+  }
+
+  getResponseFilePath(requestId: string): string {
+    const settings = this.getSettings();
+    return normalizePath(`${settings.responsesFolder}/${requestId}.response.json`);
   }
 
   async readReviewState(notePath: string): Promise<ReviewState | null> {
@@ -56,6 +72,34 @@ export class ReviewPersistence {
     }
 
     await adapter.write(logPath, line);
+  }
+
+  async writeSelectionRequest(request: CodexSelectionRequest): Promise<string> {
+    const path = this.getRequestFilePath(request.requestId);
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, JSON.stringify(request, null, 2));
+    return path;
+  }
+
+  async listSelectionResponses(): Promise<string[]> {
+    const folderPath = normalizePath(this.getSettings().responsesFolder);
+    await this.ensureFolder(folderPath);
+    const listed = await this.app.vault.adapter.list(folderPath);
+    return listed.files
+      .map((path) => normalizePath(path))
+      .filter((path) => path.endsWith(".response.json"));
+  }
+
+  async readSelectionResponse(path: string): Promise<CodexSelectionResponse> {
+    const raw = await this.app.vault.adapter.read(path);
+    return JSON.parse(raw) as CodexSelectionResponse;
+  }
+
+  async deleteFile(path: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    if (await adapter.exists(path)) {
+      await adapter.remove(path);
+    }
   }
 
   private async ensureParentFolder(path: string): Promise<void> {
