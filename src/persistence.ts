@@ -1,6 +1,12 @@
 import { App, normalizePath } from "obsidian";
 import { sha256 } from "./hash";
-import type { AiReviewSettings, AuditEvent, ReviewState } from "./types";
+import type {
+  AiReviewSettings,
+  AuditEvent,
+  CodexSelectionRequest,
+  CodexSelectionResponse,
+  ReviewState
+} from "./types";
 
 export class ReviewPersistence {
   constructor(
@@ -9,10 +15,35 @@ export class ReviewPersistence {
   ) {}
 
   getReviewFilePath(notePath: string): string {
-    const settings = this.getSettings();
     const noteHash = sha256(normalizePath(notePath));
-    const fileName = `${noteHash}.review.json`;
-    return normalizePath(`${settings.reviewsFolder}/${fileName}`);
+    return this.getArtifactPath(this.getSettings().reviewsFolder, `${noteHash}.review.json`);
+  }
+
+  getRequestFilePath(requestId: string): string {
+    return this.getArtifactPath(this.getSettings().requestsFolder, `${requestId}.request.json`);
+  }
+
+  getResponseFilePath(requestId: string): string {
+    return this.getArtifactPath(this.getSettings().responsesFolder, `${requestId}.response.json`);
+  }
+
+  getResponseTemplateFilePath(requestId: string): string {
+    return this.getArtifactPath(
+      this.getSettings().responsesFolder,
+      `${requestId}.response.template.json`
+    );
+  }
+
+  getLaunchGuideFilePath(requestId: string): string {
+    return this.getArtifactPath(this.getSettings().requestsFolder, `${requestId}.launch.md`);
+  }
+
+  getWatcherScriptPath(): string {
+    return this.getArtifactPath(this.getSettings().reviewsFolder, "watch-review-inbox.ps1");
+  }
+
+  getResponseSchemaPath(): string {
+    return this.getArtifactPath(this.getSettings().reviewsFolder, "codex-response-schema.json");
   }
 
   async readReviewState(notePath: string): Promise<ReviewState | null> {
@@ -28,9 +59,7 @@ export class ReviewPersistence {
 
   async writeReviewState(state: ReviewState): Promise<string> {
     const reviewPath = this.getReviewFilePath(state.notePath);
-    await this.ensureParentFolder(reviewPath);
-    await this.app.vault.adapter.write(reviewPath, JSON.stringify(state, null, 2));
-    return reviewPath;
+    return this.writeJsonFile(reviewPath, state);
   }
 
   async appendAuditEvent(event: AuditEvent): Promise<void> {
@@ -56,6 +85,63 @@ export class ReviewPersistence {
     }
 
     await adapter.write(logPath, line);
+  }
+
+  async writeSelectionRequest(request: CodexSelectionRequest): Promise<string> {
+    return this.writeJsonFile(this.getRequestFilePath(request.requestId), request);
+  }
+
+  async writeResponseTemplate(requestId: string, template: unknown): Promise<string> {
+    return this.writeJsonFile(this.getResponseTemplateFilePath(requestId), template);
+  }
+
+  async writeLaunchGuide(requestId: string, content: string): Promise<string> {
+    return this.writeTextFile(this.getLaunchGuideFilePath(requestId), content);
+  }
+
+  async writeWatcherScript(content: string): Promise<string> {
+    return this.writeTextFile(this.getWatcherScriptPath(), content);
+  }
+
+  async writeResponseSchema(content: string): Promise<string> {
+    return this.writeTextFile(this.getResponseSchemaPath(), content);
+  }
+
+  async listSelectionResponses(): Promise<string[]> {
+    const folderPath = normalizePath(this.getSettings().responsesFolder);
+    await this.ensureFolder(folderPath);
+    const listed = await this.app.vault.adapter.list(folderPath);
+    return listed.files
+      .map((path) => normalizePath(path))
+      .filter((path) => path.endsWith(".response.json"));
+  }
+
+  async readSelectionResponse(path: string): Promise<CodexSelectionResponse> {
+    const raw = await this.app.vault.adapter.read(path);
+    return JSON.parse(raw) as CodexSelectionResponse;
+  }
+
+  async deleteFile(path: string): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    if (await adapter.exists(path)) {
+      await adapter.remove(path);
+    }
+  }
+
+  private getArtifactPath(folderPath: string, fileName: string): string {
+    return normalizePath(`${normalizePath(folderPath)}/${fileName}`);
+  }
+
+  private async writeJsonFile(path: string, value: unknown): Promise<string> {
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, JSON.stringify(value, null, 2));
+    return path;
+  }
+
+  private async writeTextFile(path: string, content: string): Promise<string> {
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, content);
+    return path;
   }
 
   private async ensureParentFolder(path: string): Promise<void> {

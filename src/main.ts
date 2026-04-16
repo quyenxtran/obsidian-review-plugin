@@ -1,6 +1,17 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
+import {
+  Editor,
+  MarkdownView,
+  Menu,
+  Modal,
+  Notice,
+  Plugin,
+  TFile,
+  normalizePath,
+  type EventRef
+} from "obsidian";
 import { MapMode, type ChangeDesc } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
+import * as nodePath from "path";
 import { sha256 } from "./hash";
 import { ReviewPersistence } from "./persistence";
 import {
@@ -12,10 +23,43 @@ import { AiReviewSettingTab } from "./settingsTab";
 import {
   DEFAULT_SETTINGS,
   type AiReviewSettings,
-  type ReviewPayload,
+  type CodexSelectionRequest,
+  type CodexSelectionResponse,
   type ReviewState,
   type Suggestion
 } from "./types";
+
+type CodeMirrorDispatchSpec = Parameters<import("@codemirror/view").EditorView["dispatch"]>[0];
+
+interface DispatchableCodeMirrorView {
+  dispatch(spec: CodeMirrorDispatchSpec): void;
+}
+
+interface NodeChildProcessModule {
+  spawn: (
+    command: string,
+    args: string[],
+    options?: { detached?: boolean; stdio?: string; windowsHide?: boolean }
+  ) => { unref?: () => void; pid?: number };
+  execFileSync: (
+    command: string,
+    args: string[],
+    options?: { encoding?: BufferEncoding; windowsHide?: boolean }
+  ) => string;
+}
+
+interface NodeFsModule {
+  existsSync(path: string): boolean;
+}
+
+declare module "obsidian" {
+  interface Workspace {
+    on(
+      name: "editor-menu",
+      callback: (menu: Menu, editor: Editor, view: MarkdownView) => void
+    ): EventRef;
+  }
+}
 
 export default class AiReviewPlugin extends Plugin {
   settings: AiReviewSettings = DEFAULT_SETTINGS;
@@ -25,6 +69,7 @@ export default class AiReviewPlugin extends Plugin {
   selectedSuggestionId: string | null = null;
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
+  private lastSurfacedSuggestionId: string | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -41,10 +86,18 @@ export default class AiReviewPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: "ai-review-import-json",
-      name: "AI Review: Import suggestions from JSON",
+      id: "ai-review-suggest-selection",
+      name: "AI Review: Request Codex suggestion for selection",
       callback: async () => {
-        await this.importSuggestionsFromJson();
+        await this.createSelectionRequest();
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-check-responses",
+      name: "AI Review: Check for Codex responses",
+      callback: async () => {
+        await this.importCodexResponsesForActiveFile();
       }
     });
 
@@ -53,6 +106,14 @@ export default class AiReviewPlugin extends Plugin {
       name: "AI Review: Next suggestion",
       callback: () => {
         this.moveSuggestionSelection(1);
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-open-current",
+      name: "AI Review: Open current suggestion",
+      callback: async () => {
+        await this.openCurrentSuggestionModal();
       }
     });
 
@@ -107,6 +168,23 @@ export default class AiReviewPlugin extends Plugin {
     });
 
     this.registerEvent(
+      this.app.workspace.on("editor-menu", (menu: Menu, editor: Editor, view: MarkdownView) => {
+        const selectedText = editor.getSelection();
+        if (!selectedText.trim()) {
+          return;
+        }
+
+        menu.addItem((item) => {
+          item
+            .setTitle("AI Review Selection")
+            .setIcon("sparkles")
+            .onClick(() => {
+              void this.createSelectionRequest(view, editor);
+            });
+        });
+      })
+    );
+    this.registerEvent(
       this.app.workspace.on("active-leaf-change", async () => {
         await this.loadStateForActiveFile();
       })
@@ -116,94 +194,21 @@ export default class AiReviewPlugin extends Plugin {
         await this.loadStateForActiveFile();
       })
     );
+    this.registerInterval(
+      window.setInterval(() => {
+        void this.importCodexResponsesForActiveFile();
+      }, 4000)
+    );
     await this.loadStateForActiveFile();
   }
 
   private async loadSettings(): Promise<void> {
-    const loaded = (await this.loadData()) as Partial<AiReviewSettings> | null;
-    this.settings = { ...DEFAULT_SETTINGS, ...(loaded ?? {}) };
+    const loaded = await this.loadData();
+    this.settings = { ...DEFAULT_SETTINGS, ...parseSettingsData(loaded) };
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
-  }
-
-  private async importSuggestionsFromJson(): Promise<void> {
-    const activeFile = this.getActiveMarkdownFile();
-    if (!activeFile) {
-      new Notice("Open a markdown note before importing suggestions.");
-      return;
-    }
-
-    const payload = await this.pickReviewPayload();
-    if (!payload) {
-      return;
-    }
-
-    const activePath = normalizePath(activeFile.path);
-    const payloadPath = normalizePath(payload.notePath);
-    if (activePath !== payloadPath) {
-      new Notice(`Payload is for "${payloadPath}", but active note is "${activePath}".`);
-      return;
-    }
-
-    const content = await this.app.vault.cachedRead(activeFile);
-    const currentHash = sha256(content);
-    const stale = currentHash !== payload.baseHash;
-    const now = new Date().toISOString();
-    const suggestions = payload.suggestions.map((suggestion) => {
-      return {
-        ...suggestion,
-        status: stale ? "stale" : "pending",
-        createdAt: suggestion.createdAt || now,
-        decidedAt: stale ? now : undefined,
-        decidedBy: stale ? this.settings.reviewerName || undefined : undefined
-      } satisfies Suggestion;
-    });
-
-    const state: ReviewState = {
-      schemaVersion: 1,
-      notePath: activePath,
-      baseHash: payload.baseHash,
-      currentHash,
-      suggestions,
-      importedAt: now,
-      updatedAt: now
-    };
-
-    const reviewFile = await this.persistence.writeReviewState(state);
-    this.currentReviewState = state;
-    this.activeNotePath = activePath;
-    this.selectedSuggestionId = this.currentReviewState.suggestions.find((item) => item.status === "pending")?.id ?? null;
-    await this.persistence.appendAuditEvent({
-      eventType: "import",
-      notePath: activePath,
-      reviewFile,
-      timestamp: now,
-      reviewer: this.settings.reviewerName || undefined,
-      baseHash: payload.baseHash,
-      currentHash,
-      payloadGenerator: payload.generator.source
-    });
-
-    if (stale) {
-      await this.persistence.appendAuditEvent({
-        eventType: "mark_stale",
-        notePath: activePath,
-        reviewFile,
-        timestamp: now,
-        reviewer: this.settings.reviewerName || undefined,
-        baseHash: payload.baseHash,
-        currentHash,
-        payloadGenerator: payload.generator.source
-      });
-      new Notice(`Imported ${suggestions.length} suggestions, but marked stale (hash mismatch).`);
-      this.refreshActiveEditorDecorations();
-      return;
-    }
-
-    new Notice(`Imported ${suggestions.length} suggestions.`);
-    this.refreshActiveEditorDecorations();
   }
 
   private getActiveMarkdownFile(): TFile | null {
@@ -214,112 +219,126 @@ export default class AiReviewPlugin extends Plugin {
     return view.file;
   }
 
-  private async pickReviewPayload(): Promise<ReviewPayload | null> {
-    const file = await this.pickJsonFile();
-    if (!file) {
-      return null;
-    }
-    const text = await file.text();
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      new Notice("Could not parse JSON file.");
-      return null;
+  private async createSelectionRequest(
+    providedView?: MarkdownView,
+    providedEditor?: Editor
+  ): Promise<void> {
+    const view = providedView ?? this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view?.file) {
+      new Notice("Open a markdown note before creating a Codex request.");
+      return;
     }
 
-    try {
-      return this.parseReviewPayload(parsed);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Invalid review payload.";
-      new Notice(message);
-      return null;
-    }
-  }
-
-  private parseReviewPayload(raw: unknown): ReviewPayload {
-    if (!isObject(raw)) {
-      throw new Error("Payload must be a JSON object.");
-    }
-    if (raw.schemaVersion !== 1) {
-      throw new Error("Only schemaVersion 1 is supported.");
-    }
-    if (typeof raw.notePath !== "string" || !raw.notePath.trim()) {
-      throw new Error("Payload notePath is required.");
-    }
-    if (typeof raw.baseHash !== "string" || !raw.baseHash.trim()) {
-      throw new Error("Payload baseHash is required.");
-    }
-    if (!isObject(raw.generator) || raw.generator.source !== "codex") {
-      throw new Error("Payload generator.source must be \"codex\".");
-    }
-    if (typeof raw.generator.generatedAt !== "string" || !raw.generator.generatedAt.trim()) {
-      throw new Error("Payload generator.generatedAt is required.");
-    }
-    if (!Array.isArray(raw.suggestions)) {
-      throw new Error("Payload suggestions must be an array.");
+    const editor = providedEditor ?? view.editor;
+    const selectedText = editor.getSelection();
+    if (!selectedText.trim()) {
+      new Notice("Select text in the note first.");
+      return;
     }
 
+    const selectionStart = editor.posToOffset(editor.getCursor("from"));
+    const selectionEnd = editor.posToOffset(editor.getCursor("to"));
+    if (selectionStart === undefined || selectionEnd === undefined || selectionEnd < selectionStart) {
+      new Notice("Could not determine the selected text range.");
+      return;
+    }
+
+    const notePath = normalizePath(view.file.path);
+    const noteText = editor.getValue();
+    const currentHash = sha256(noteText);
+    const state = await this.ensureReviewStateForNote(notePath, currentHash);
     const now = new Date().toISOString();
-    const suggestions = raw.suggestions.map((item, index) => {
-      if (!isObject(item)) {
-        throw new Error(`Suggestion at index ${index} must be an object.`);
-      }
-      if (typeof item.start !== "number" || typeof item.end !== "number") {
-        throw new Error(`Suggestion at index ${index} must include numeric start/end.`);
-      }
-      if (item.start < 0 || item.end < item.start) {
-        throw new Error(`Suggestion at index ${index} has invalid offsets.`);
-      }
-      if (typeof item.expectedOldText !== "string" || typeof item.newText !== "string") {
-        throw new Error(`Suggestion at index ${index} must include text fields.`);
-      }
-      if (item.rationale !== undefined && typeof item.rationale !== "string") {
-        throw new Error(`Suggestion at index ${index} has invalid rationale.`);
-      }
-      if (item.id !== undefined && typeof item.id !== "string") {
-        throw new Error(`Suggestion at index ${index} has invalid id.`);
-      }
-      if (item.createdAt !== undefined && typeof item.createdAt !== "string") {
-        throw new Error(`Suggestion at index ${index} has invalid createdAt.`);
-      }
+    const currentTarget = noteText.slice(selectionStart, selectionEnd);
+    if (currentTarget !== selectedText) {
+      new Notice("The selected text changed before generation completed. Try again.");
+      return;
+    }
 
-      return {
-        id: item.id ?? `s-${index + 1}`,
-        start: item.start,
-        end: item.end,
-        expectedOldText: item.expectedOldText,
-        newText: item.newText,
-        rationale: item.rationale,
-        status: "pending",
-        createdAt: item.createdAt ?? now
-      } satisfies Suggestion;
-    });
+    const requestId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const contextBefore = noteText.slice(Math.max(0, selectionStart - 500), selectionStart);
+    const contextAfter = noteText.slice(selectionEnd, Math.min(noteText.length, selectionEnd + 500));
 
-    return {
-      schemaVersion: 1,
-      notePath: raw.notePath,
-      baseHash: raw.baseHash,
-      generator: {
-        source: "codex",
-        model: typeof raw.generator.model === "string" ? raw.generator.model : undefined,
-        generatedAt: raw.generator.generatedAt
-      },
-      suggestions
+    const replacedCount = await this.replaceOverlappingSuggestions(
+      state,
+      selectionStart,
+      selectionEnd,
+      now
+    );
+    const suggestion: Suggestion = {
+      id: requestId,
+      requestId,
+      start: selectionStart,
+      end: selectionEnd,
+      expectedOldText: selectedText,
+      newText: "",
+      status: "requested",
+      createdAt: now
     };
-  }
+    const request: CodexSelectionRequest = {
+      schemaVersion: 1,
+      requestId,
+      notePath,
+      baseHash: currentHash,
+      createdAt: now,
+      instruction: this.settings.defaultEditInstruction,
+      contextBefore,
+      contextAfter,
+      selection: {
+        start: selectionStart,
+        end: selectionEnd,
+        text: selectedText
+      }
+    };
 
-  private async pickJsonFile(): Promise<File | null> {
-    return await new Promise<File | null>((resolve) => {
-      const input = document.createElement("input");
-      input.type = "file";
-      input.accept = ".json,application/json";
-      input.onchange = () => {
-        resolve(input.files?.item(0) ?? null);
-      };
-      input.click();
+    state.suggestions.push(suggestion);
+    state.currentHash = currentHash;
+    state.updatedAt = now;
+    if (!state.importedAt) {
+      state.importedAt = now;
+    }
+    this.currentReviewState = state;
+    this.activeNotePath = notePath;
+    this.selectedSuggestionId = suggestion.id;
+    const requestFile = await this.persistence.writeSelectionRequest(request);
+    const responseFile = this.persistence.getResponseFilePath(requestId);
+    const absoluteNotePath = this.getAbsoluteNotePath(view.file);
+    const vaultBase = this.getVaultBasePath();
+    const absoluteRequestFile = vaultBase ? nodePath.join(vaultBase, requestFile) : requestFile;
+    const absoluteResponseFile = vaultBase ? nodePath.join(vaultBase, responseFile) : responseFile;
+    const responseTemplateFile = await this.persistence.writeResponseTemplate(
+      requestId,
+      buildCodexResponseTemplate(request)
+    );
+    const absoluteResponseTemplateFile = vaultBase
+      ? nodePath.join(vaultBase, responseTemplateFile)
+      : responseTemplateFile;
+    const launchGuideFile = await this.persistence.writeLaunchGuide(
+      requestId,
+      buildCodexLaunchGuide(
+        request,
+        absoluteRequestFile,
+        absoluteResponseFile,
+        absoluteResponseTemplateFile,
+        absoluteNotePath
+      )
+    );
+    const reviewFile = await this.persistence.writeReviewState(state);
+    await this.persistence.appendAuditEvent({
+      eventType: "request",
+      notePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      toStatus: "requested",
+      baseHash: state.baseHash,
+      currentHash: state.currentHash
     });
+    this.refreshActiveEditorDecorations();
+    const suffix = replacedCount > 0 ? ` Replaced ${replacedCount} overlapping suggestion(s).` : "";
+    await this.maybeLaunchCodexWatcherForFile(view.file);
+    new Notice(`Created Codex request.${suffix} Response expected in ${this.settings.responsesFolder}.`);
+    console.info("AI Review request file:", requestFile);
   }
 
   async loadStateForActiveFile(): Promise<void> {
@@ -337,6 +356,39 @@ export default class AiReviewPlugin extends Plugin {
     this.selectedSuggestionId =
       this.currentReviewState?.suggestions.find((item) => item.status === "pending")?.id ?? null;
     this.refreshActiveEditorDecorations();
+    this.maybeSurfacePendingSuggestion();
+  }
+
+  private async ensureReviewStateForNote(
+    notePath: string,
+    currentHash: string
+  ): Promise<ReviewState> {
+    if (this.currentReviewState && this.activeNotePath === notePath) {
+      this.currentReviewState.currentHash = currentHash;
+      return this.currentReviewState;
+    }
+
+    const existing = await this.persistence.readReviewState(notePath);
+    if (existing) {
+      existing.currentHash = currentHash;
+      this.currentReviewState = existing;
+      this.activeNotePath = notePath;
+      return existing;
+    }
+
+    const now = new Date().toISOString();
+    const created: ReviewState = {
+      schemaVersion: 1,
+      notePath,
+      baseHash: currentHash,
+      currentHash,
+      suggestions: [],
+      importedAt: now,
+      updatedAt: now
+    };
+    this.currentReviewState = created;
+    this.activeNotePath = notePath;
+    return created;
   }
 
   getRenderableSuggestions(): Suggestion[] {
@@ -345,9 +397,9 @@ export default class AiReviewPlugin extends Plugin {
     }
     return this.currentReviewState.suggestions.filter((suggestion) => {
       return (
-        suggestion.status === "pending" ||
-        suggestion.status === "stale" ||
-        suggestion.status === "conflict"
+        (suggestion.status === "pending" ||
+          suggestion.status === "conflict") &&
+        suggestion.newText.trim().length > 0
       );
     });
   }
@@ -363,14 +415,14 @@ export default class AiReviewPlugin extends Plugin {
       new Notice(`Suggestion ${id} was not found.`);
       return;
     }
-    if (suggestion.status !== "pending") {
-      new Notice(`Suggestion ${id} is already ${suggestion.status}.`);
+    if (action === "reject" && (suggestion.status === "pending" || suggestion.status === "conflict" || suggestion.status === "requested")) {
+      await this.markSuggestionRejected(suggestion);
+      this.selectFallbackSuggestion();
       return;
     }
 
-    if (action === "reject") {
-      await this.markSuggestionRejected(suggestion);
-      this.selectFallbackSuggestion();
+    if (suggestion.status !== "pending") {
+      new Notice(`Suggestion ${id} is already ${suggestion.status}.`);
       return;
     }
 
@@ -389,8 +441,8 @@ export default class AiReviewPlugin extends Plugin {
       new Notice(`Suggestion ${id} was not found.`);
       return;
     }
-    if (suggestion.status !== "pending") {
-      new Notice(`Only pending suggestions can be edited.`);
+    if (suggestion.status !== "pending" && suggestion.status !== "conflict") {
+      new Notice(`Only pending or conflicted suggestions can be edited.`);
       return;
     }
 
@@ -416,6 +468,62 @@ export default class AiReviewPlugin extends Plugin {
     });
     this.refreshActiveEditorDecorations();
     new Notice(`Updated suggestion ${suggestion.id}.`);
+  }
+
+  async onSuggestionResolve(id: string): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      new Notice("No review state loaded for this note.");
+      return;
+    }
+
+    const suggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+    if (!suggestion) {
+      new Notice(`Suggestion ${id} was not found.`);
+      return;
+    }
+    if (suggestion.status !== "conflict") {
+      new Notice(`Suggestion ${id} is not conflicted.`);
+      return;
+    }
+
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new Notice("No active markdown file.");
+      return;
+    }
+
+    const currentText = await this.app.vault.cachedRead(file);
+    const start = Math.max(0, Math.min(suggestion.start, currentText.length));
+    const end = Math.max(start, Math.min(suggestion.end, currentText.length));
+    const currentTarget = currentText.slice(start, end);
+    if (!currentTarget) {
+      new Notice(`Suggestion ${id} cannot be resolved because the current target range is empty.`);
+      return;
+    }
+
+    const previousStatus = suggestion.status;
+    suggestion.start = start;
+    suggestion.end = end;
+    suggestion.expectedOldText = currentTarget;
+    suggestion.status = "pending";
+    suggestion.decidedAt = undefined;
+    suggestion.decidedBy = undefined;
+    this.currentReviewState.updatedAt = new Date().toISOString();
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "resolve",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: this.currentReviewState.updatedAt,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      fromStatus: previousStatus,
+      toStatus: "pending",
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash
+    });
+    this.refreshActiveEditorDecorations();
+    new Notice(`Resolved suggestion ${suggestion.id}. You can accept it now.`);
   }
 
   async onEditorDocumentChanged(update: ViewUpdate): Promise<void> {
@@ -451,8 +559,7 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private refreshActiveEditorDecorations(): void {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    const cm = (view?.editor as unknown as { cm?: { dispatch: (spec: unknown) => void } }).cm;
+    const cm = this.getActiveCodeMirrorView();
     if (!cm) {
       return;
     }
@@ -461,10 +568,440 @@ export default class AiReviewPlugin extends Plugin {
     });
   }
 
+  private getActiveCodeMirrorView():
+    | DispatchableCodeMirrorView
+    | null {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      return null;
+    }
+
+    return (
+      readDispatchableCodeMirrorView(view, ["editor", "cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["editor", "cm"]) ??
+      readDispatchableCodeMirrorView(view, ["editor", "editor", "cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["editor", "editor", "cm"]) ??
+      readDispatchableCodeMirrorView(view, ["cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["cm"]) ??
+      readDispatchableCodeMirrorView(view, ["editorCm"]) ??
+      readDispatchableCodeMirrorView(view, ["currentMode", "editor", "cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["currentMode", "editor", "cm"]) ??
+      null
+    );
+  }
+
   private async openSuggestionEditModal(suggestion: Suggestion): Promise<string | null> {
     return await new Promise<string | null>((resolve) => {
       new EditSuggestionModal(this.app, suggestion.newText, resolve).open();
     });
+  }
+
+  private async openCurrentSuggestionModal(): Promise<void> {
+    const suggestion = this.getLatestActionableSuggestion();
+
+    if (!suggestion) {
+      new Notice("No pending or conflicted suggestion is available.");
+      return;
+    }
+
+    await this.openSuggestionReviewModal(suggestion.id);
+  }
+
+  private maybeSurfacePendingSuggestion(): void {
+    const suggestion = this.getLatestActionableSuggestion();
+
+    if (!suggestion) {
+      this.lastSurfacedSuggestionId = null;
+      return;
+    }
+
+    if (this.lastSurfacedSuggestionId === suggestion.id) {
+      return;
+    }
+
+    this.lastSurfacedSuggestionId = suggestion.id;
+    window.setTimeout(() => {
+      void this.openSuggestionReviewModal(suggestion.id);
+    }, 100);
+  }
+
+  private async openSuggestionReviewModal(id: string): Promise<void> {
+    if (!this.currentReviewState) {
+      return;
+    }
+
+    const suggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+    if (!suggestion) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      new ReviewSuggestionModal(
+        this.app,
+        suggestion,
+        async (decision) => {
+          if (!this.currentReviewState) {
+            resolve();
+            return;
+          }
+          const liveSuggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+          if (!liveSuggestion) {
+            resolve();
+            return;
+          }
+
+          if (decision.editedText !== liveSuggestion.newText) {
+            liveSuggestion.newText = decision.editedText;
+            this.currentReviewState.updatedAt = new Date().toISOString();
+            await this.persistence.writeReviewState(this.currentReviewState);
+          }
+
+          if (decision.action === "accept") {
+            await this.onSuggestionAction(id, "accept");
+          } else if (decision.action === "reject") {
+            await this.onSuggestionAction(id, "reject");
+          }
+          resolve();
+        },
+        () => resolve()
+      ).open();
+    });
+  }
+
+  private async importCodexResponsesForActiveFile(): Promise<void> {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      return;
+    }
+
+    const notePath = normalizePath(file.path);
+    const state = await this.ensureReviewStateForNote(notePath, sha256(await this.app.vault.cachedRead(file)));
+    const responseFiles = await this.persistence.listSelectionResponses();
+    let importedCount = 0;
+
+    for (const responseFile of responseFiles) {
+      let response: CodexSelectionResponse;
+      try {
+        response = parseCodexSelectionResponse(
+          await this.persistence.readSelectionResponse(responseFile)
+        );
+      } catch (error) {
+        console.warn("AI Review skipped an unreadable Codex response.", responseFile, error);
+        continue;
+      }
+
+      if (normalizePath(response.notePath) !== notePath) {
+        continue;
+      }
+
+      const imported = await this.applyCodexResponse(state, response, responseFile);
+      if (imported) {
+        importedCount += 1;
+      }
+    }
+
+    if (importedCount > 0) {
+      this.refreshActiveEditorDecorations();
+      new Notice(`Imported ${importedCount} Codex response${importedCount === 1 ? "" : "s"}.`);
+    }
+  }
+
+  private async applyCodexResponse(
+    state: ReviewState,
+    response: CodexSelectionResponse,
+    responseFile: string
+  ): Promise<boolean> {
+    if (!this.activeNotePath) {
+      return false;
+    }
+
+    const placeholder = state.suggestions.find(
+      (suggestion) => suggestion.requestId === response.requestId
+    );
+    if (!placeholder) {
+      return false;
+    }
+
+    const noteFile = this.getActiveMarkdownFile();
+    if (!noteFile) {
+      return false;
+    }
+    const noteText = await this.app.vault.cachedRead(noteFile);
+    const currentHash = sha256(noteText);
+    const now = new Date().toISOString();
+
+    placeholder.rationale = response.suggestion.rationale;
+    placeholder.newText = normalizeAiOutput(response.suggestion.newText);
+
+    if (!placeholder.newText) {
+      await this.persistence.deleteFile(responseFile);
+      return false;
+    }
+
+    const currentTarget = noteText.slice(placeholder.start, placeholder.end);
+    if (placeholder.status === "requested") {
+      if (currentTarget === placeholder.expectedOldText && currentHash === response.baseHash) {
+        placeholder.status = "pending";
+        placeholder.decidedAt = undefined;
+        placeholder.decidedBy = undefined;
+      } else {
+        placeholder.status = "conflict";
+        placeholder.decidedAt = now;
+        placeholder.decidedBy = this.settings.reviewerName || undefined;
+      }
+    }
+
+    state.currentHash = currentHash;
+    state.updatedAt = now;
+    this.selectedSuggestionId = placeholder.status === "pending" ? placeholder.id : this.selectedSuggestionId;
+    const reviewFile = await this.persistence.writeReviewState(state);
+    await this.persistence.appendAuditEvent({
+      eventType: "generate",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: placeholder.id,
+      fromStatus: "requested",
+      toStatus: placeholder.status,
+      baseHash: state.baseHash,
+      currentHash: state.currentHash,
+      payloadGenerator: response.generator.model || response.generator.source
+    });
+    await this.persistence.deleteFile(responseFile);
+    this.jumpToSuggestion(placeholder);
+    if (placeholder.status === "pending" || placeholder.status === "conflict") {
+      this.lastSurfacedSuggestionId = placeholder.id;
+      void this.openSuggestionReviewModal(placeholder.id);
+    }
+    return true;
+  }
+
+  private async replaceOverlappingSuggestions(
+    state: ReviewState,
+    start: number,
+    end: number,
+    timestamp: string
+  ): Promise<number> {
+    if (!this.activeNotePath) {
+      return 0;
+    }
+
+    const overlapping = state.suggestions.filter((suggestion) => {
+      if (
+        suggestion.status !== "requested" &&
+        suggestion.status !== "pending" &&
+        suggestion.status !== "conflict"
+      ) {
+        return false;
+      }
+      return rangesOverlap(suggestion.start, suggestion.end, start, end);
+    });
+
+    if (overlapping.length === 0) {
+      return 0;
+    }
+
+    const reviewFile = await this.persistence.writeReviewState(state);
+    for (const suggestion of overlapping) {
+      const fromStatus = suggestion.status;
+      suggestion.status = "rejected";
+      suggestion.decidedAt = timestamp;
+      suggestion.decidedBy = this.settings.reviewerName || undefined;
+      await this.persistence.appendAuditEvent({
+        eventType: "reject",
+        notePath: this.activeNotePath,
+        reviewFile,
+        timestamp,
+        reviewer: this.settings.reviewerName || undefined,
+        suggestionId: suggestion.id,
+        fromStatus,
+        toStatus: "rejected",
+        baseHash: state.baseHash,
+        currentHash: state.currentHash
+      });
+    }
+
+    return overlapping.length;
+  }
+
+  private async maybeLaunchCodexWatcherForFile(file: TFile): Promise<void> {
+    if (!this.settings.autoLaunchCodex) {
+      return;
+    }
+    if (typeof window.require !== "function") {
+      return;
+    }
+    if (process.platform !== "win32") {
+      return;
+    }
+
+    const noteFolder = this.getAbsoluteNoteFolder(file);
+    if (!noteFolder) {
+      return;
+    }
+    const normalizedFolder = nodePath.normalize(noteFolder);
+    if (this.detectExistingWatcherForFolder(normalizedFolder)) {
+      return;
+    }
+
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) {
+      return;
+    }
+
+    const resolvedCodexCommand = this.resolveCodexCliCommand();
+    if (!resolvedCodexCommand) {
+      new Notice("AI Review could not find a Codex CLI executable. Set an explicit Codex CLI command in plugin settings.");
+      return;
+    }
+
+    const watcherScriptPath = await this.persistence.writeWatcherScript(buildCodexWatcherScript());
+    const responseSchemaPath = await this.persistence.writeResponseSchema(
+      JSON.stringify(buildCodexResponseJsonSchema(), null, 2)
+    );
+    const absoluteWatcherScriptPath = nodePath.join(vaultBase, watcherScriptPath);
+    const absoluteRequestsPath = nodePath.join(vaultBase, this.settings.requestsFolder);
+    const absoluteResponsesPath = nodePath.join(vaultBase, this.settings.responsesFolder);
+    const absoluteSchemaPath = nodePath.join(vaultBase, responseSchemaPath);
+
+    try {
+      const childProcess = getNodeChildProcessModule();
+      if (!childProcess) {
+        throw new Error("child_process module is unavailable.");
+      }
+      const child = childProcess.spawn(
+        "cmd.exe",
+        [
+          "/c",
+          "start",
+          "",
+          "/D",
+          normalizedFolder,
+          "powershell.exe",
+          "-NoExit",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          absoluteWatcherScriptPath,
+          "-VaultBasePath",
+          vaultBase,
+          "-NoteFolder",
+          normalizedFolder,
+          "-RequestsFolder",
+          absoluteRequestsPath,
+          "-ResponsesFolder",
+          absoluteResponsesPath,
+          "-ResponseSchemaPath",
+          absoluteSchemaPath,
+          "-CodexCommand",
+          resolvedCodexCommand
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true
+        }
+      );
+      child.unref?.();
+    } catch (error) {
+      console.error("AI Review could not launch Codex terminal.", error);
+      new Notice("AI Review could not auto-launch the Codex watcher. Check the Codex CLI command in settings.");
+    }
+  }
+
+  private detectExistingWatcherForFolder(folderPath: string): boolean {
+    if (process.platform !== "win32") {
+      return false;
+    }
+
+    try {
+      const childProcess = getNodeChildProcessModule();
+      if (!childProcess) {
+        return false;
+      }
+      const escapedFolderPath = folderPath.replace(/'/g, "''");
+      const script = [
+        `$folder = '${escapedFolderPath}'`,
+        "Get-CimInstance Win32_Process |",
+        "Where-Object {",
+        "  $_.Name -match 'powershell' -and",
+        "  $_.CommandLine -match 'watch-review-inbox\\.ps1' -and",
+        "  $_.CommandLine -like ('*' + $folder + '*')",
+        "} |",
+        "Select-Object -First 1 -ExpandProperty ProcessId"
+      ].join(" ");
+      const output = childProcess.execFileSync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", script],
+        { encoding: "utf8", windowsHide: true }
+      ).trim();
+      return Boolean(output);
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveCodexCliCommand(): string | null {
+    const configured = this.settings.codexCliCommand.trim();
+    const fs = getNodeFsModule();
+    if (configured) {
+      if (fs && nodePath.isAbsolute(configured) && fs.existsSync(configured)) {
+        return configured;
+      }
+
+      const resolvedConfigured = findCommandOnPath(configured);
+      if (resolvedConfigured) {
+        return resolvedConfigured;
+      }
+    }
+
+    for (const candidate of getBundledCodexCandidates()) {
+      if (fs?.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    for (const candidate of ["codex.cmd", "codex.ps1", "codex"]) {
+      const resolvedCandidate = findCommandOnPath(candidate);
+      if (resolvedCandidate) {
+        return resolvedCandidate;
+      }
+    }
+
+    return configured || null;
+  }
+
+  private getVaultBasePath(): string | null {
+    const adapter = this.app.vault.adapter;
+    if (hasVaultBasePath(adapter) && typeof adapter.getBasePath === "function") {
+      return adapter.getBasePath();
+    }
+    if (hasVaultBasePath(adapter) && typeof adapter.basePath === "string" && adapter.basePath.trim()) {
+      return adapter.basePath;
+    }
+    return null;
+  }
+
+  private getAbsoluteNoteFolder(file: TFile): string | null {
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) {
+      return null;
+    }
+
+    const relativeDir = nodePath.dirname(file.path);
+    if (!relativeDir || relativeDir === ".") {
+      return vaultBase;
+    }
+    return nodePath.join(vaultBase, relativeDir);
+  }
+
+  private getAbsoluteNotePath(file: TFile): string | null {
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) {
+      return null;
+    }
+    return nodePath.join(vaultBase, file.path);
   }
 
   private async markSuggestionRejected(suggestion: Suggestion): Promise<void> {
@@ -684,7 +1221,7 @@ export default class AiReviewPlugin extends Plugin {
       return [];
     }
     return this.currentReviewState.suggestions
-      .filter((suggestion) => suggestion.status === "pending")
+      .filter((suggestion) => suggestion.status === "pending" && suggestion.newText.trim().length > 0)
       .sort((a, b) => {
         if (a.start !== b.start) {
           return a.start - b.start;
@@ -749,6 +1286,27 @@ export default class AiReviewPlugin extends Plugin {
     }
   }
 
+  private getLatestActionableSuggestion(): Suggestion | null {
+    if (!this.currentReviewState) {
+      return null;
+    }
+
+    const actionable = this.currentReviewState.suggestions
+      .filter((suggestion) => {
+        if (suggestion.newText.trim().length === 0) {
+          return false;
+        }
+        return suggestion.status === "pending" || suggestion.status === "conflict";
+      })
+      .sort((a, b) => {
+        const timeA = Date.parse(a.createdAt || "");
+        const timeB = Date.parse(b.createdAt || "");
+        return timeB - timeA;
+      });
+
+    return actionable[0] ?? null;
+  }
+
   private rebasePendingSuggestionsAfterAccepted(
     accepted: Suggestion,
     delta: number,
@@ -760,7 +1318,10 @@ export default class AiReviewPlugin extends Plugin {
 
     const conflicts: Suggestion[] = [];
     for (const suggestion of this.currentReviewState.suggestions) {
-      if (suggestion.id === accepted.id || suggestion.status !== "pending") {
+      if (
+        suggestion.id === accepted.id ||
+        (suggestion.status !== "pending" && suggestion.status !== "requested")
+      ) {
         continue;
       }
 
@@ -793,11 +1354,25 @@ export default class AiReviewPlugin extends Plugin {
 
     const conflicts: Suggestion[] = [];
     for (const suggestion of this.currentReviewState.suggestions) {
-      if (suggestion.status !== "pending") {
+      if (suggestion.status !== "pending" && suggestion.status !== "requested") {
         continue;
       }
 
       if (doesChangeOverlapSuggestion(changes, suggestion)) {
+        const overlapRange = findOverlappingChangedRange(changes, suggestion);
+        const mappedStart = changes.mapPos(suggestion.start, 1, MapMode.Simple);
+        const mappedEnd = changes.mapPos(suggestion.end, -1, MapMode.Simple);
+        if (
+          mappedStart !== null &&
+          mappedEnd !== null &&
+          mappedEnd >= mappedStart
+        ) {
+          suggestion.start = mappedStart;
+          suggestion.end = mappedEnd;
+        } else if (overlapRange) {
+          suggestion.start = overlapRange.fromB;
+          suggestion.end = overlapRange.toB;
+        }
         suggestion.status = "conflict";
         suggestion.decidedAt = timestamp;
         suggestion.decidedBy = this.settings.reviewerName || undefined;
@@ -908,8 +1483,539 @@ class EditSuggestionModal extends Modal {
   }
 }
 
+class ReviewSuggestionModal extends Modal {
+  private handled = false;
+
+  constructor(
+    app: Plugin["app"],
+    private readonly suggestion: Suggestion,
+    private readonly onResolve: (decision: {
+      action: "accept" | "reject" | "cancel";
+      editedText: string;
+    }) => Promise<void> | void,
+    private readonly onCancelOnly: () => void
+  ) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    const { contentEl, modalEl } = this;
+    modalEl.addClass("ai-review-review-modal");
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Review suggestion" });
+
+    const status = contentEl.createEl("p", { cls: "ai-review-review-status" });
+    status.textContent = `Status: ${this.suggestion.status}`;
+
+    contentEl.createEl("h3", { text: "Current text" });
+    const original = contentEl.createEl("pre", { cls: "ai-review-review-original" });
+    original.textContent = this.suggestion.expectedOldText || "[empty selection]";
+
+    contentEl.createEl("h3", { text: "Suggested text" });
+    const textarea = contentEl.createEl("textarea", {
+      cls: "ai-review-review-textarea"
+    });
+    textarea.value = this.suggestion.newText;
+    textarea.rows = 12;
+
+    if (this.suggestion.rationale) {
+      const rationale = contentEl.createEl("p", { cls: "ai-review-review-rationale" });
+      rationale.textContent = `Rationale: ${this.suggestion.rationale}`;
+    }
+
+    const actions = contentEl.createDiv({ cls: "ai-review-review-actions" });
+    const cancelButton = actions.createEl("button", { text: "Cancel" });
+    cancelButton.onclick = () => {
+      this.handled = true;
+      void this.onResolve({ action: "cancel", editedText: textarea.value });
+      this.close();
+    };
+
+    const rejectButton = actions.createEl("button", { text: "Reject" });
+    rejectButton.onclick = () => {
+      this.handled = true;
+      void this.onResolve({ action: "reject", editedText: textarea.value });
+      this.close();
+    };
+
+    const acceptButton = actions.createEl("button", {
+      text: "Accept",
+      cls: "mod-cta"
+    });
+    acceptButton.onclick = () => {
+      this.handled = true;
+      void this.onResolve({ action: "accept", editedText: textarea.value });
+      this.close();
+    };
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
+    if (!this.handled) {
+      this.onCancelOnly();
+    }
+  }
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function parseSettingsData(raw: unknown): Partial<AiReviewSettings> {
+  if (!isObject(raw)) {
+    return {};
+  }
+
+  const settings: Partial<AiReviewSettings> = {};
+  if (typeof raw.reviewsFolder === "string") {
+    settings.reviewsFolder = raw.reviewsFolder;
+  }
+  if (typeof raw.requestsFolder === "string") {
+    settings.requestsFolder = raw.requestsFolder;
+  }
+  if (typeof raw.responsesFolder === "string") {
+    settings.responsesFolder = raw.responsesFolder;
+  }
+  if (typeof raw.auditLogPath === "string") {
+    settings.auditLogPath = raw.auditLogPath;
+  }
+  if (typeof raw.reviewerName === "string") {
+    settings.reviewerName = raw.reviewerName;
+  }
+  if (typeof raw.defaultEditInstruction === "string") {
+    settings.defaultEditInstruction = raw.defaultEditInstruction;
+  }
+  if (typeof raw.autoLaunchCodex === "boolean") {
+    settings.autoLaunchCodex = raw.autoLaunchCodex;
+  }
+  if (typeof raw.codexCliCommand === "string") {
+    settings.codexCliCommand = raw.codexCliCommand;
+  }
+
+  return settings;
+}
+
+function getNodeModule(moduleName: string): unknown | null {
+  if (typeof window.require !== "function") {
+    return null;
+  }
+
+  try {
+    return window.require(moduleName);
+  } catch {
+    return null;
+  }
+}
+
+function isNodeChildProcessModule(value: unknown): value is NodeChildProcessModule {
+  return (
+    isObject(value) &&
+    typeof value.spawn === "function" &&
+    typeof value.execFileSync === "function"
+  );
+}
+
+function getNodeChildProcessModule(): NodeChildProcessModule | null {
+  const moduleValue = getNodeModule("child_process");
+  return isNodeChildProcessModule(moduleValue) ? moduleValue : null;
+}
+
+function findCommandOnPath(command: string): string | null {
+  const childProcess = getNodeChildProcessModule();
+  if (!childProcess || !command.trim()) {
+    return null;
+  }
+
+  try {
+    const output = childProcess.execFileSync("where.exe", [command], {
+      encoding: "utf8",
+      windowsHide: true
+    });
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getBundledCodexCandidates(): string[] {
+  const candidates = [
+    process.env.APPDATA ? nodePath.join(process.env.APPDATA, "npm", "codex.cmd") : "",
+    process.env.APPDATA ? nodePath.join(process.env.APPDATA, "npm", "codex.ps1") : "",
+    "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe",
+    "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex"
+  ];
+
+  return candidates.filter((candidate) => candidate.length > 0);
+}
+
+function isNodeFsModule(value: unknown): value is NodeFsModule {
+  return isObject(value) && typeof value.existsSync === "function";
+}
+
+function getNodeFsModule(): NodeFsModule | null {
+  const moduleValue = getNodeModule("fs");
+  return isNodeFsModule(moduleValue) ? moduleValue : null;
+}
+
+function readDispatchableCodeMirrorView(
+  root: unknown,
+  path: string[]
+): DispatchableCodeMirrorView | null {
+  let current: unknown = root;
+  for (const key of path) {
+    if (!isObject(current)) {
+      return null;
+    }
+    current = current[key];
+  }
+
+  return isDispatchableCodeMirrorView(current) ? current : null;
+}
+
+function isDispatchableCodeMirrorView(value: unknown): value is DispatchableCodeMirrorView {
+  return isObject(value) && typeof value.dispatch === "function";
+}
+
+function hasVaultBasePath(
+  value: unknown
+): value is { getBasePath?: () => string; basePath?: string } {
+  return isObject(value);
+}
+
+function normalizeAiOutput(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function buildCodexResponseTemplate(request: CodexSelectionRequest): CodexSelectionResponse {
+  return {
+    schemaVersion: 1,
+    requestId: request.requestId,
+    notePath: request.notePath,
+    baseHash: request.baseHash,
+    generator: {
+      source: "codex",
+      model: "",
+      generatedAt: ""
+    },
+    suggestion: {
+      newText: "",
+      rationale: ""
+    }
+  };
+}
+
+function buildCodexLaunchGuide(
+  request: CodexSelectionRequest,
+  requestFile: string,
+  responseFile: string,
+  responseTemplateFile: string,
+  absoluteNotePath: string | null
+): string {
+  return [
+    "# AI Review Codex Launch Guide",
+    "",
+    "You were launched by the Obsidian AI Review plugin.",
+    "",
+    "## Task",
+    "- Read the full note first so you have whole-document context before suggesting an edit.",
+    "- Read the request JSON and response template.",
+    "- Produce one revision suggestion for the selected span.",
+    "- When ready, write the final response JSON to the exact response path below.",
+    "- The plugin will import that response automatically.",
+    "",
+    "## Files",
+    `- Request JSON: ${requestFile}`,
+    `- Response JSON to write: ${responseFile}`,
+    `- Response template JSON: ${responseTemplateFile}`,
+    `- Full note path: ${absoluteNotePath ?? request.notePath}`,
+    "",
+    "## Request Summary",
+    `- Request ID: ${request.requestId}`,
+    `- Note path: ${request.notePath}`,
+    `- Base hash: ${request.baseHash}`,
+    `- Instruction: ${request.instruction}`,
+    "",
+    "### Selected text",
+    "```text",
+    request.selection.text || "",
+    "```",
+    "",
+    "### Context before",
+    "```text",
+    request.contextBefore || "[none]",
+    "```",
+    "",
+    "### Context after",
+    "```text",
+    request.contextAfter || "[none]",
+    "```",
+    "",
+    "## Required response schema",
+    "```json",
+    JSON.stringify(buildCodexResponseTemplate(request), null, 2),
+    "```",
+    "",
+    "## Rules",
+    "- Return only one replacement suggestion per request.",
+    "- Preserve citation markers, equations, units, markdown, and claim scope unless the user explicitly wants more aggressive edits.",
+    "- Fill `generator.model` and `generator.generatedAt` before writing the final response JSON.",
+    "- Fill `suggestion.newText` with the replacement text only.",
+    "- Fill `suggestion.rationale` with a short sentence."
+  ].join("\n");
+}
+
+function buildCodexResponseJsonSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["schemaVersion", "requestId", "notePath", "baseHash", "generator", "suggestion"],
+    properties: {
+      schemaVersion: { type: "integer", const: 1 },
+      requestId: { type: "string" },
+      notePath: { type: "string" },
+      baseHash: { type: "string" },
+      generator: {
+        type: "object",
+        additionalProperties: false,
+        required: ["source", "model", "generatedAt"],
+        properties: {
+          source: { type: "string", const: "codex" },
+          model: { type: "string" },
+          generatedAt: { type: "string" }
+        }
+      },
+      suggestion: {
+        type: "object",
+        additionalProperties: false,
+        required: ["newText", "rationale"],
+        properties: {
+          newText: { type: "string" },
+          rationale: { type: "string" }
+        }
+      }
+    }
+  };
+}
+
+function buildCodexWatcherScript(): string {
+  return [
+    "param(",
+    "  [Parameter(Mandatory=$true)][string]$VaultBasePath,",
+    "  [Parameter(Mandatory=$true)][string]$NoteFolder,",
+    "  [Parameter(Mandatory=$true)][string]$RequestsFolder,",
+    "  [Parameter(Mandatory=$true)][string]$ResponsesFolder,",
+    "  [Parameter(Mandatory=$true)][string]$ResponseSchemaPath,",
+    "  [Parameter(Mandatory=$true)][string]$CodexCommand",
+    ")",
+    "",
+    "$ErrorActionPreference = 'Continue'",
+    "",
+    "function Log([string]$Message) {",
+    "  Write-Host \"[AI Review Watcher] $Message\"",
+    "}",
+    "",
+    "function Normalize([string]$PathValue) {",
+    "  try {",
+    "    return [System.IO.Path]::GetFullPath($PathValue)",
+    "  } catch {",
+    "    return $PathValue",
+    "  }",
+    "}",
+    "",
+    "function Get-RequestIdFromPath([string]$PathValue) {",
+    "  return [System.IO.Path]::GetFileName($PathValue) -replace '\\.request\\.json$', ''",
+    "}",
+    "",
+    "function Clean-JsonText([string]$RawText) {",
+    "  if (-not $RawText) {",
+    "    return ''",
+    "  }",
+    "  $trimmed = $RawText.Trim()",
+    "  if ($trimmed.StartsWith('```')) {",
+    "    $trimmed = [regex]::Replace($trimmed, '^```(?:json)?\\s*', '')",
+    "    $trimmed = [regex]::Replace($trimmed, '\\s*```$', '')",
+    "  }",
+    "  return $trimmed.Trim()",
+    "}",
+    "",
+    "function Invoke-Request([string]$RequestPath) {",
+    "  $requestId = Get-RequestIdFromPath $RequestPath",
+    "  $lockPath = Join-Path $RequestsFolder \"$requestId.processing.lock\"",
+    "  $donePath = Join-Path $RequestsFolder \"$requestId.done\"",
+    "  $responsePath = Join-Path $ResponsesFolder \"$requestId.response.json\"",
+    "  $templatePath = Join-Path $ResponsesFolder \"$requestId.response.template.json\"",
+    "  $guidePath = Join-Path $RequestsFolder \"$requestId.launch.md\"",
+    "  $tempOutputPath = Join-Path $ResponsesFolder \"$requestId.codex-output.json\"",
+    "  $runLogPath = Join-Path $ResponsesFolder \"$requestId.codex.log\"",
+    "  $errorPath = Join-Path $ResponsesFolder \"$requestId.error.log\"",
+    "",
+    "  if ((Test-Path $donePath) -or (Test-Path $responsePath) -or (Test-Path $lockPath)) {",
+    "    return",
+    "  }",
+    "",
+    "  try {",
+    "    $requestRaw = Get-Content -LiteralPath $RequestPath -Raw",
+    "    $request = $requestRaw | ConvertFrom-Json",
+    "  } catch {",
+    "    Log \"Skipping unreadable request: $RequestPath\"",
+    "    return",
+    "  }",
+    "",
+    "  $notePath = Join-Path $VaultBasePath $request.notePath",
+    "  $requestNoteFolder = Split-Path -Parent $notePath",
+    "  if ((Normalize $requestNoteFolder) -ne (Normalize $NoteFolder)) {",
+    "    return",
+    "  }",
+    "",
+    "  New-Item -ItemType File -Path $lockPath -Force | Out-Null",
+    "  try {",
+    "    Log \"Processing $requestId\"",
+    "    if (-not (Test-Path $notePath)) {",
+    "      throw \"Note file not found: $notePath\"",
+    "    }",
+    "    $noteRaw = Get-Content -LiteralPath $notePath -Raw",
+    "    $templateRaw = if (Test-Path $templatePath) { Get-Content -LiteralPath $templatePath -Raw } else { '' }",
+    "    $guideRaw = if (Test-Path $guidePath) { Get-Content -LiteralPath $guidePath -Raw } else { '' }",
+    "    $prompt = @\"",
+    "Generate one Obsidian AI Review response.",
+    "",
+    "Important constraints:",
+    "- Do not use tools.",
+    "- Do not run shell commands.",
+    "- Do not read any files.",
+    "- All context you need is included below.",
+    "- Return exactly one JSON object matching the response schema.",
+    "- Return raw JSON only. No markdown fences. No commentary.",
+    "- Preserve citation markers, equations, units, markdown, and claim scope unless the request itself implies a change.",
+    "- Fill suggestion.rationale with one short sentence.",
+    "",
+    "REQUEST JSON",
+    "$requestRaw",
+    "",
+    "RESPONSE TEMPLATE JSON",
+    "$templateRaw",
+    "",
+    "FULL NOTE MARKDOWN",
+    "$noteRaw",
+    "",
+    "LAUNCH GUIDE",
+    "$guideRaw",
+    "\"@",
+    "",
+    "    & $CodexCommand exec -C $NoteFolder --skip-git-repo-check --disable plugins --ephemeral --color never --output-schema $ResponseSchemaPath -o $tempOutputPath $prompt *> $runLogPath",
+    "    $codexExitCode = $LASTEXITCODE",
+    "    if ($codexExitCode -ne 0 -and -not (Test-Path $tempOutputPath)) {",
+    "      throw \"Codex exited with code $codexExitCode. See $runLogPath\"",
+    "    }",
+    "",
+    "    if (-not (Test-Path $tempOutputPath)) {",
+    "      throw \"Codex did not write an output file.\"",
+    "    }",
+    "",
+    "    $rawOutput = Get-Content -LiteralPath $tempOutputPath -Raw",
+    "    $jsonText = Clean-JsonText $rawOutput",
+    "    $parsed = $jsonText | ConvertFrom-Json",
+    "",
+    "    if (-not $parsed.generator.generatedAt) {",
+    "      $parsed.generator.generatedAt = (Get-Date).ToString(\"o\")",
+    "    }",
+    "    if (-not $parsed.generator.source) {",
+    "      $parsed.generator.source = 'codex'",
+    "    }",
+    "    if (-not $parsed.generator.model) {",
+    "      $parsed.generator.model = 'codex'",
+    "    }",
+    "",
+    "    $parsed | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $responsePath -Encoding UTF8",
+    "    New-Item -ItemType File -Path $donePath -Force | Out-Null",
+    "    if (Test-Path $errorPath) {",
+    "      Remove-Item -LiteralPath $errorPath -Force",
+    "    }",
+    "    Log \"Wrote response for $requestId\"",
+    "  } catch {",
+    "    (($_ | Out-String) + \"`n`nRun log: $runLogPath\") | Set-Content -LiteralPath $errorPath -Encoding UTF8",
+    "    Log \"Failed $requestId. See $errorPath\"",
+    "  } finally {",
+    "    if (Test-Path $tempOutputPath) {",
+    "      Remove-Item -LiteralPath $tempOutputPath -Force",
+    "    }",
+    "    if (Test-Path $lockPath) {",
+    "      Remove-Item -LiteralPath $lockPath -Force",
+    "    }",
+    "  }",
+    "}",
+    "",
+    "Log \"Watching requests in $RequestsFolder for note folder $NoteFolder\"",
+    "while ($true) {",
+    "  try {",
+    "    if (-not (Test-Path $RequestsFolder)) {",
+    "      Start-Sleep -Seconds 2",
+    "      continue",
+    "    }",
+    "    Get-ChildItem -LiteralPath $RequestsFolder -Filter *.request.json -File -ErrorAction SilentlyContinue |",
+    "      Sort-Object LastWriteTime, Name |",
+    "      ForEach-Object {",
+    "        Invoke-Request $_.FullName",
+    "      }",
+    "  } catch {",
+    "    Log (\"Watcher loop error: \" + ($_ | Out-String))",
+    "  }",
+    "  Start-Sleep -Seconds 2",
+    "}"
+  ].join("\n");
+}
+
+function parseCodexSelectionResponse(raw: unknown): CodexSelectionResponse {
+  if (!isObject(raw)) {
+    throw new Error("Response must be an object.");
+  }
+  if (raw.schemaVersion !== 1) {
+    throw new Error("Unsupported response schemaVersion.");
+  }
+  if (typeof raw.requestId !== "string" || !raw.requestId.trim()) {
+    throw new Error("Response requestId is required.");
+  }
+  if (typeof raw.notePath !== "string" || !raw.notePath.trim()) {
+    throw new Error("Response notePath is required.");
+  }
+  if (typeof raw.baseHash !== "string" || !raw.baseHash.trim()) {
+    throw new Error("Response baseHash is required.");
+  }
+  if (!isObject(raw.generator) || raw.generator.source !== "codex") {
+    throw new Error("Response generator.source must be codex.");
+  }
+  if (typeof raw.generator.generatedAt !== "string" || !raw.generator.generatedAt.trim()) {
+    throw new Error("Response generator.generatedAt is required.");
+  }
+  if (!isObject(raw.suggestion) || typeof raw.suggestion.newText !== "string") {
+    throw new Error("Response suggestion.newText is required.");
+  }
+
+  return {
+    schemaVersion: 1,
+    requestId: raw.requestId,
+    notePath: raw.notePath,
+    baseHash: raw.baseHash,
+    generator: {
+      source: "codex",
+      model: typeof raw.generator.model === "string" ? raw.generator.model : undefined,
+      generatedAt: raw.generator.generatedAt
+    },
+    suggestion: {
+      newText: raw.suggestion.newText,
+      rationale: typeof raw.suggestion.rationale === "string" ? raw.suggestion.rationale : undefined
+    }
+  };
 }
 
 function applySuggestionsDeterministically(
@@ -966,4 +2072,48 @@ function doesChangeOverlapSuggestion(changes: ChangeDesc, suggestion: Suggestion
   });
 
   return overlaps;
+}
+
+function findOverlappingChangedRange(
+  changes: ChangeDesc,
+  suggestion: Suggestion
+): { fromB: number; toB: number } | null {
+  let overlap: { fromB: number; toB: number } | null = null;
+
+  changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+    if (overlap) {
+      return;
+    }
+
+    if (fromA === toA) {
+      if (suggestion.start < fromA && fromA < suggestion.end) {
+        overlap = { fromB, toB };
+      }
+      return;
+    }
+
+    if (suggestion.start < toA && fromA < suggestion.end) {
+      overlap = { fromB, toB };
+    }
+  });
+
+  return overlap;
+}
+
+function rangesOverlap(
+  aStart: number,
+  aEnd: number,
+  bStart: number,
+  bEnd: number
+): boolean {
+  if (aStart === aEnd && bStart === bEnd) {
+    return aStart === bStart;
+  }
+  if (aStart === aEnd) {
+    return bStart <= aStart && aStart <= bEnd;
+  }
+  if (bStart === bEnd) {
+    return aStart <= bStart && bStart <= aEnd;
+  }
+  return aStart < bEnd && bStart < aEnd;
 }

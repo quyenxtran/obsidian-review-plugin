@@ -12,14 +12,24 @@ import type { ReviewStatus, Suggestion } from "./types";
 
 export type SuggestionAction = "accept" | "reject";
 
-export interface ReviewDecorationHost {
+interface ReviewDecorationHost {
   getRenderableSuggestions(): Suggestion[];
   onSuggestionAction(id: string, action: SuggestionAction): Promise<void> | void;
   onSuggestionEdit(id: string): Promise<void> | void;
+  onSuggestionResolve(id: string): Promise<void> | void;
   onEditorDocumentChanged(update: ViewUpdate): Promise<void> | void;
 }
 
 export const refreshReviewEffect = StateEffect.define<void>();
+
+const STATUS_CLASS_BY_REVIEW_STATUS: Record<ReviewStatus, string> = {
+  requested: "ai-review-status-pending",
+  pending: "ai-review-status-pending",
+  accepted: "ai-review-status-accepted",
+  rejected: "ai-review-status-rejected",
+  stale: "ai-review-status-stale",
+  conflict: "ai-review-status-conflict"
+};
 
 export function createReviewDecorationsExtension(host: ReviewDecorationHost) {
   return ViewPlugin.fromClass(
@@ -81,19 +91,7 @@ function clampOffset(offset: number, docLength: number): number {
 }
 
 function statusToClass(status: ReviewStatus): string {
-  if (status === "stale") {
-    return "ai-review-status-stale";
-  }
-  if (status === "conflict") {
-    return "ai-review-status-conflict";
-  }
-  if (status === "accepted") {
-    return "ai-review-status-accepted";
-  }
-  if (status === "rejected") {
-    return "ai-review-status-rejected";
-  }
-  return "ai-review-status-pending";
+  return STATUS_CLASS_BY_REVIEW_STATUS[status];
 }
 
 class SuggestionControlsWidget extends WidgetType {
@@ -129,40 +127,44 @@ class SuggestionControlsWidget extends WidgetType {
     container.appendChild(statusLabel);
 
     const isPending = this.suggestion.status === "pending";
-    const acceptButton = document.createElement("button");
-    acceptButton.textContent = "Accept";
-    acceptButton.disabled = !isPending;
-    acceptButton.className = "ai-review-accept-button";
-    acceptButton.onclick = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void this.host.onSuggestionAction(this.suggestion.id, "accept");
-    };
+    const isConflict = this.suggestion.status === "conflict";
+    const buttons = [
+      createControlButton("Resolve", "ai-review-resolve-button", !isConflict, () =>
+        this.host.onSuggestionResolve(this.suggestion.id)
+      ),
+      createControlButton("Edit", "ai-review-edit-button", !(isPending || isConflict), () =>
+        this.host.onSuggestionEdit(this.suggestion.id)
+      ),
+      createControlButton("Accept", "ai-review-accept-button", !isPending, () =>
+        this.host.onSuggestionAction(this.suggestion.id, "accept")
+      ),
+      createControlButton("Reject", "ai-review-reject-button", !(isPending || isConflict), () =>
+        this.host.onSuggestionAction(this.suggestion.id, "reject")
+      )
+    ];
 
-    const rejectButton = document.createElement("button");
-    rejectButton.textContent = "Reject";
-    rejectButton.disabled = !isPending;
-    rejectButton.className = "ai-review-reject-button";
-    rejectButton.onclick = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void this.host.onSuggestionAction(this.suggestion.id, "reject");
-    };
-
-    const editButton = document.createElement("button");
-    editButton.textContent = "Edit";
-    editButton.disabled = !isPending;
-    editButton.className = "ai-review-edit-button";
-    editButton.onclick = (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      void this.host.onSuggestionEdit(this.suggestion.id);
-    };
-
-    container.appendChild(editButton);
-    container.appendChild(acceptButton);
-    container.appendChild(rejectButton);
+    for (const button of buttons) {
+      container.appendChild(button);
+    }
 
     return container;
   }
+}
+
+function createControlButton(
+  label: string,
+  className: string,
+  disabled: boolean,
+  onActivate: () => Promise<void> | void
+): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.textContent = label;
+  button.disabled = disabled;
+  button.className = className;
+  button.onclick = (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    void onActivate();
+  };
+  return button;
 }

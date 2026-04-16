@@ -37,8 +37,8 @@
   border-radius: 4px;
   background-color: color-mix(in srgb, var(--color-green) 22%, transparent);
   color: var(--text-normal);
-  font-size: 11px;
-  line-height: 1.35;
+  font: inherit;
+  line-height: inherit;
   max-width: min(56rem, 100%);
   padding: 2px 6px;
   white-space: pre-wrap;
@@ -62,14 +62,40 @@
   background-color: color-mix(in srgb, var(--color-orange) 22%, transparent);
 }
 
-.ai-review-edit-modal textarea.ai-review-edit-textarea {
+.ai-review-review-status,
+.ai-review-review-rationale {
+  color: var(--text-muted);
+  margin: 0.5rem 0 0.75rem;
+}
+
+.ai-review-review-original {
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  font: inherit;
+  line-height: 1.45;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-review-edit-modal textarea.ai-review-edit-textarea,
+.ai-review-review-textarea {
   width: 100%;
-  min-height: 14rem;
-  margin-top: 0.75rem;
   resize: vertical;
 }
 
-.ai-review-edit-actions {
+.ai-review-edit-modal textarea.ai-review-edit-textarea {
+  min-height: 14rem;
+  margin-top: 0.75rem;
+}
+
+.ai-review-review-textarea {
+  min-height: 16rem;
+}
+
+.ai-review-edit-actions,
+.ai-review-review-actions {
   display: flex;
   justify-content: flex-end;
   gap: 0.5rem;
