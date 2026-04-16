@@ -1,4 +1,6 @@
 import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
+import { MapMode, type ChangeDesc } from "@codemirror/state";
+import type { ViewUpdate } from "@codemirror/view";
 import { sha256 } from "./hash";
 import { ReviewPersistence } from "./persistence";
 import {
@@ -21,6 +23,8 @@ export default class AiReviewPlugin extends Plugin {
   currentReviewState: ReviewState | null = null;
   activeNotePath: string | null = null;
   selectedSuggestionId: string | null = null;
+  private suppressNextDocumentRebase = false;
+  private persistReviewStateTimer: number | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -414,6 +418,38 @@ export default class AiReviewPlugin extends Plugin {
     new Notice(`Updated suggestion ${suggestion.id}.`);
   }
 
+  async onEditorDocumentChanged(update: ViewUpdate): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      return;
+    }
+    if (this.suppressNextDocumentRebase) {
+      this.suppressNextDocumentRebase = false;
+      return;
+    }
+
+    const file = this.getActiveMarkdownFile();
+    if (!file || normalizePath(file.path) !== this.activeNotePath) {
+      return;
+    }
+
+    const timestamp = new Date().toISOString();
+    const conflictedSuggestions = this.rebasePendingSuggestionsFromEditorChanges(
+      update.changes,
+      timestamp
+    );
+
+    this.currentReviewState.currentHash = sha256(update.state.doc.toString());
+    this.currentReviewState.updatedAt = timestamp;
+    this.schedulePersistReviewState();
+    this.refreshActiveEditorDecorations();
+
+    if (conflictedSuggestions.length > 0) {
+      new Notice(
+        `Edited note text remapped suggestions. ${conflictedSuggestions.length} overlapping suggestion(s) marked conflict.`
+      );
+    }
+  }
+
   private refreshActiveEditorDecorations(): void {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     const cm = (view?.editor as unknown as { cm?: { dispatch: (spec: unknown) => void } }).cm;
@@ -499,6 +535,7 @@ export default class AiReviewPlugin extends Plugin {
       return;
     }
 
+    this.suppressNextDocumentRebase = true;
     await this.app.vault.modify(file, result.nextText);
 
     const fromStatus = suggestion.status;
@@ -584,6 +621,7 @@ export default class AiReviewPlugin extends Plugin {
     }
 
     if (appliedCount > 0) {
+      this.suppressNextDocumentRebase = true;
       await this.app.vault.modify(file, result.nextText);
       this.currentReviewState.currentHash = sha256(result.nextText);
     }
@@ -744,6 +782,76 @@ export default class AiReviewPlugin extends Plugin {
 
     return conflicts;
   }
+
+  private rebasePendingSuggestionsFromEditorChanges(
+    changes: ChangeDesc,
+    timestamp: string
+  ): Suggestion[] {
+    if (!this.currentReviewState) {
+      return [];
+    }
+
+    const conflicts: Suggestion[] = [];
+    for (const suggestion of this.currentReviewState.suggestions) {
+      if (suggestion.status !== "pending") {
+        continue;
+      }
+
+      if (doesChangeOverlapSuggestion(changes, suggestion)) {
+        suggestion.status = "conflict";
+        suggestion.decidedAt = timestamp;
+        suggestion.decidedBy = this.settings.reviewerName || undefined;
+        conflicts.push(suggestion);
+        continue;
+      }
+
+      if (suggestion.start === suggestion.end) {
+        const mapped = changes.mapPos(suggestion.start, 1, MapMode.Simple);
+        if (mapped === null) {
+          suggestion.status = "conflict";
+          suggestion.decidedAt = timestamp;
+          suggestion.decidedBy = this.settings.reviewerName || undefined;
+          conflicts.push(suggestion);
+          continue;
+        }
+        suggestion.start = mapped;
+        suggestion.end = mapped;
+        continue;
+      }
+
+      const mappedStart = changes.mapPos(suggestion.start, 1, MapMode.TrackBefore);
+      const mappedEnd = changes.mapPos(suggestion.end, -1, MapMode.TrackAfter);
+      if (mappedStart === null || mappedEnd === null || mappedEnd < mappedStart) {
+        suggestion.status = "conflict";
+        suggestion.decidedAt = timestamp;
+        suggestion.decidedBy = this.settings.reviewerName || undefined;
+        conflicts.push(suggestion);
+        continue;
+      }
+
+      suggestion.start = mappedStart;
+      suggestion.end = mappedEnd;
+    }
+
+    return conflicts;
+  }
+
+  private schedulePersistReviewState(): void {
+    if (!this.currentReviewState) {
+      return;
+    }
+    if (this.persistReviewStateTimer !== null) {
+      window.clearTimeout(this.persistReviewStateTimer);
+    }
+
+    this.persistReviewStateTimer = window.setTimeout(() => {
+      if (!this.currentReviewState) {
+        return;
+      }
+      void this.persistence.writeReviewState(this.currentReviewState);
+      this.persistReviewStateTimer = null;
+    }, 250);
+  }
 }
 
 class EditSuggestionModal extends Modal {
@@ -835,4 +943,27 @@ function applySuggestionsDeterministically(
   }
 
   return { nextText: working, appliedIds, conflictedIds };
+}
+
+function doesChangeOverlapSuggestion(changes: ChangeDesc, suggestion: Suggestion): boolean {
+  let overlaps = false;
+
+  changes.iterChangedRanges((fromA, toA) => {
+    if (overlaps) {
+      return;
+    }
+
+    if (fromA === toA) {
+      if (suggestion.start < fromA && fromA < suggestion.end) {
+        overlaps = true;
+      }
+      return;
+    }
+
+    if (suggestion.start < toA && fromA < suggestion.end) {
+      overlaps = true;
+    }
+  });
+
+  return overlaps;
 }

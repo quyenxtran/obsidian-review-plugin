@@ -16,6 +16,7 @@ export interface ReviewDecorationHost {
   getRenderableSuggestions(): Suggestion[];
   onSuggestionAction(id: string, action: SuggestionAction): Promise<void> | void;
   onSuggestionEdit(id: string): Promise<void> | void;
+  onEditorDocumentChanged(update: ViewUpdate): Promise<void> | void;
 }
 
 export const refreshReviewEffect = StateEffect.define<void>();
@@ -33,6 +34,9 @@ export function createReviewDecorationsExtension(host: ReviewDecorationHost) {
         const hasRefreshEffect = update.transactions.some((tr) =>
           tr.effects.some((effect) => effect.is(refreshReviewEffect))
         );
+        if (update.docChanged) {
+          void host.onEditorDocumentChanged(update);
+        }
         if (update.docChanged || update.viewportChanged || hasRefreshEffect) {
           this.decorations = buildDecorationSet(update.view, host);
         }
