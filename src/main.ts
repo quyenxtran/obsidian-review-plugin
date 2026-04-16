@@ -6,6 +6,7 @@ import {
   type SuggestionAction,
   refreshReviewEffect
 } from "./reviewDecorations";
+import { AiReviewSettingTab } from "./settingsTab";
 import {
   DEFAULT_SETTINGS,
   type AiReviewSettings,
@@ -25,6 +26,7 @@ export default class AiReviewPlugin extends Plugin {
     await this.loadSettings();
     this.persistence = new ReviewPersistence(this.app, () => this.settings);
     this.registerEditorExtension(createReviewDecorationsExtension(this));
+    this.addSettingTab(new AiReviewSettingTab(this.app, this));
 
     this.addCommand({
       id: "ai-review-status",

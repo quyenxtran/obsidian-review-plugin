@@ -40,6 +40,15 @@ export class ReviewPersistence {
 
     const adapter = this.app.vault.adapter;
     const line = `${JSON.stringify(event)}\n`;
+
+    const adapterWithAppend = adapter as typeof adapter & {
+      append?: (path: string, data: string) => Promise<void>;
+    };
+    if (typeof adapterWithAppend.append === "function") {
+      await adapterWithAppend.append(logPath, line);
+      return;
+    }
+
     if (await adapter.exists(logPath)) {
       const previous = await adapter.read(logPath);
       await adapter.write(logPath, `${previous}${line}`);
@@ -58,12 +67,20 @@ export class ReviewPersistence {
   }
 
   private async ensureFolder(folderPath: string): Promise<void> {
-    const normalized = normalizePath(folderPath);
-    const adapter = this.app.vault.adapter;
-    if (await adapter.exists(normalized)) {
+    const normalized = normalizePath(folderPath).replace(/\/+$/g, "");
+    if (!normalized) {
       return;
     }
-    await adapter.mkdir(normalized);
+
+    const segments = normalized.split("/");
+    const adapter = this.app.vault.adapter;
+    let current = "";
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      if (await adapter.exists(current)) {
+        continue;
+      }
+      await adapter.mkdir(current);
+    }
   }
 }
-
