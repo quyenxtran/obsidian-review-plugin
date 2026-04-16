@@ -30,8 +30,12 @@ DOCX-style review workflow for AI edits in markdown notes:
   - `.obsidian/ai-review/<sha256(notePath)>.review.json`
 - Selection requests:
   - `.obsidian/ai-review/requests/<requestId>.request.json`
+- Launch guides for spawned Codex terminals:
+  - `.obsidian/ai-review/requests/<requestId>.launch.md`
 - Completed Codex responses:
   - `.obsidian/ai-review/responses/<requestId>.response.json`
+- Response templates for Codex to fill:
+  - `.obsidian/ai-review/responses/<requestId>.response.template.json`
 - Audit log (append-only NDJSON):
   - `.obsidian/ai-review/review-log.ndjson`
 
@@ -42,9 +46,10 @@ Both paths are configurable in plugin settings.
 2. Run `AI Review: Request Codex suggestion for selection`.
 3. If auto-launch is enabled, the plugin opens a Codex terminal in the same folder as the active markdown file the first time it needs one in that folder.
 4. The plugin writes a request JSON file into `.obsidian/ai-review/requests/`.
-5. In terminal Codex, read that request and write a matching response JSON into `.obsidian/ai-review/responses/`.
-6. The plugin polls for responses and converts them into inline pending suggestions automatically.
-7. Accept, reject, or edit the inline suggestion in Obsidian.
+5. The plugin also writes a launch guide and a response template so the spawned Codex terminal has the exact schema and file targets available immediately.
+6. In terminal Codex, read the guide, then write a matching response JSON into `.obsidian/ai-review/responses/`.
+7. The plugin polls for responses and converts them into inline pending suggestions automatically.
+8. Accept, reject, or edit the inline suggestion in Obsidian.
 
 ## Auto-launch Notes
 - Current implementation is Windows-first.

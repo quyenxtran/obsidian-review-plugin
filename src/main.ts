@@ -426,6 +426,14 @@ export default class AiReviewPlugin extends Plugin {
     this.selectedSuggestionId = suggestion.id;
     const requestFile = await this.persistence.writeSelectionRequest(request);
     const responseFile = this.persistence.getResponseFilePath(requestId);
+    const responseTemplateFile = await this.persistence.writeResponseTemplate(
+      requestId,
+      buildCodexResponseTemplate(request)
+    );
+    const launchGuideFile = await this.persistence.writeLaunchGuide(
+      requestId,
+      buildCodexLaunchGuide(request, requestFile, responseFile, responseTemplateFile)
+    );
     const reviewFile = await this.persistence.writeReviewState(state);
     await this.persistence.appendAuditEvent({
       eventType: "request",
@@ -440,7 +448,7 @@ export default class AiReviewPlugin extends Plugin {
     });
     this.refreshActiveEditorDecorations();
     const suffix = replacedCount > 0 ? ` Replaced ${replacedCount} overlapping suggestion(s).` : "";
-    await this.maybeLaunchCodexForFile(view.file, requestFile, responseFile);
+    await this.maybeLaunchCodexForFile(view.file, requestFile, responseFile, launchGuideFile);
     new Notice(`Created Codex request.${suffix} Response expected in ${this.settings.responsesFolder}.`);
     console.info("AI Review request file:", requestFile);
   }
@@ -832,7 +840,8 @@ export default class AiReviewPlugin extends Plugin {
   private async maybeLaunchCodexForFile(
     file: TFile,
     requestPath: string,
-    responsePath: string
+    responsePath: string,
+    launchGuidePath: string
   ): Promise<void> {
     if (!this.settings.autoLaunchCodex) {
       return;
@@ -860,8 +869,10 @@ export default class AiReviewPlugin extends Plugin {
 
     const absoluteRequestPath = nodePath.join(vaultBase, requestPath);
     const absoluteResponsePath = nodePath.join(vaultBase, responsePath);
+    const absoluteLaunchGuidePath = nodePath.join(vaultBase, launchGuidePath);
     const codexPrompt = [
       "An Obsidian AI Review request is waiting.",
+      `Read this launch guide first: ${absoluteLaunchGuidePath}`,
       `Request JSON: ${absoluteRequestPath}`,
       `Write response JSON to: ${absoluteResponsePath}`,
       "Stay in this folder, help the user interactively, and produce exactly the response schema the plugin expects."
@@ -1400,6 +1411,81 @@ function normalizeAiOutput(value: string): string {
     return trimmed.slice(1, -1).trim();
   }
   return trimmed;
+}
+
+function buildCodexResponseTemplate(request: CodexSelectionRequest): CodexSelectionResponse {
+  return {
+    schemaVersion: 1,
+    requestId: request.requestId,
+    notePath: request.notePath,
+    baseHash: request.baseHash,
+    generator: {
+      source: "codex",
+      model: "",
+      generatedAt: ""
+    },
+    suggestion: {
+      newText: "",
+      rationale: ""
+    }
+  };
+}
+
+function buildCodexLaunchGuide(
+  request: CodexSelectionRequest,
+  requestFile: string,
+  responseFile: string,
+  responseTemplateFile: string
+): string {
+  return [
+    "# AI Review Codex Launch Guide",
+    "",
+    "You were launched by the Obsidian AI Review plugin.",
+    "",
+    "## Task",
+    "- Read the request JSON.",
+    "- Work with the user interactively in this terminal if they want to refine the edit.",
+    "- When ready, write the final response JSON to the exact response path below.",
+    "- The plugin will import that response automatically.",
+    "",
+    "## Files",
+    `- Request JSON: ${requestFile}`,
+    `- Response JSON to write: ${responseFile}`,
+    `- Response template JSON: ${responseTemplateFile}`,
+    "",
+    "## Request Summary",
+    `- Request ID: ${request.requestId}`,
+    `- Note path: ${request.notePath}`,
+    `- Base hash: ${request.baseHash}`,
+    `- Instruction: ${request.instruction}`,
+    "",
+    "### Selected text",
+    "```text",
+    request.selection.text || "",
+    "```",
+    "",
+    "### Context before",
+    "```text",
+    request.contextBefore || "[none]",
+    "```",
+    "",
+    "### Context after",
+    "```text",
+    request.contextAfter || "[none]",
+    "```",
+    "",
+    "## Required response schema",
+    "```json",
+    JSON.stringify(buildCodexResponseTemplate(request), null, 2),
+    "```",
+    "",
+    "## Rules",
+    "- Return only one replacement suggestion per request.",
+    "- Preserve citation markers, equations, units, markdown, and claim scope unless the user explicitly wants more aggressive edits.",
+    "- Fill `generator.model` and `generator.generatedAt` before writing the final response JSON.",
+    "- Fill `suggestion.newText` with the replacement text only.",
+    "- `suggestion.rationale` is optional but recommended and should stay short."
+  ].join("\n");
 }
 
 function parseCodexSelectionResponse(raw: unknown): CodexSelectionResponse {

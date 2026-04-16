@@ -31,6 +31,16 @@ export class ReviewPersistence {
     return normalizePath(`${settings.responsesFolder}/${requestId}.response.json`);
   }
 
+  getResponseTemplateFilePath(requestId: string): string {
+    const settings = this.getSettings();
+    return normalizePath(`${settings.responsesFolder}/${requestId}.response.template.json`);
+  }
+
+  getLaunchGuideFilePath(requestId: string): string {
+    const settings = this.getSettings();
+    return normalizePath(`${settings.requestsFolder}/${requestId}.launch.md`);
+  }
+
   async readReviewState(notePath: string): Promise<ReviewState | null> {
     const reviewPath = this.getReviewFilePath(notePath);
     const adapter = this.app.vault.adapter;
@@ -78,6 +88,20 @@ export class ReviewPersistence {
     const path = this.getRequestFilePath(request.requestId);
     await this.ensureParentFolder(path);
     await this.app.vault.adapter.write(path, JSON.stringify(request, null, 2));
+    return path;
+  }
+
+  async writeResponseTemplate(requestId: string, template: unknown): Promise<string> {
+    const path = this.getResponseTemplateFilePath(requestId);
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, JSON.stringify(template, null, 2));
+    return path;
+  }
+
+  async writeLaunchGuide(requestId: string, content: string): Promise<string> {
+    const path = this.getLaunchGuideFilePath(requestId);
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, content);
     return path;
   }
 
