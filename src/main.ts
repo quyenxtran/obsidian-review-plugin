@@ -459,6 +459,8 @@ export default class AiReviewPlugin extends Plugin {
     suggestion.status = "accepted";
     suggestion.decidedAt = now;
     suggestion.decidedBy = this.settings.reviewerName || undefined;
+    const delta = suggestion.newText.length - (suggestion.end - suggestion.start);
+    const rebasedConflicts = this.rebasePendingSuggestionsAfterAccepted(suggestion, delta, now);
     this.currentReviewState.currentHash = sha256(result.nextText);
     this.currentReviewState.updatedAt = now;
     const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
@@ -474,7 +476,27 @@ export default class AiReviewPlugin extends Plugin {
       baseHash: this.currentReviewState.baseHash,
       currentHash: this.currentReviewState.currentHash
     });
+    for (const conflicted of rebasedConflicts) {
+      await this.persistence.appendAuditEvent({
+        eventType: "conflict",
+        notePath: this.activeNotePath,
+        reviewFile,
+        timestamp: now,
+        reviewer: this.settings.reviewerName || undefined,
+        suggestionId: conflicted.id,
+        fromStatus: "pending",
+        toStatus: "conflict",
+        baseHash: this.currentReviewState.baseHash,
+        currentHash: this.currentReviewState.currentHash
+      });
+    }
     this.refreshActiveEditorDecorations();
+    if (rebasedConflicts.length > 0) {
+      new Notice(
+        `Accepted suggestion ${suggestion.id}. ${rebasedConflicts.length} overlapping suggestion(s) marked conflict.`
+      );
+      return;
+    }
     new Notice(`Accepted suggestion ${suggestion.id}.`);
   }
 
@@ -641,6 +663,40 @@ export default class AiReviewPlugin extends Plugin {
     if (next) {
       this.jumpToSuggestion(next);
     }
+  }
+
+  private rebasePendingSuggestionsAfterAccepted(
+    accepted: Suggestion,
+    delta: number,
+    timestamp: string
+  ): Suggestion[] {
+    if (!this.currentReviewState) {
+      return [];
+    }
+
+    const conflicts: Suggestion[] = [];
+    for (const suggestion of this.currentReviewState.suggestions) {
+      if (suggestion.id === accepted.id || suggestion.status !== "pending") {
+        continue;
+      }
+
+      if (suggestion.end <= accepted.start) {
+        continue;
+      }
+
+      if (suggestion.start >= accepted.end) {
+        suggestion.start += delta;
+        suggestion.end += delta;
+        continue;
+      }
+
+      suggestion.status = "conflict";
+      suggestion.decidedAt = timestamp;
+      suggestion.decidedBy = this.settings.reviewerName || undefined;
+      conflicts.push(suggestion);
+    }
+
+    return conflicts;
   }
 }
 
