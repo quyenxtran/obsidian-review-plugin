@@ -28,6 +28,7 @@ export default class AiReviewPlugin extends Plugin {
   selectedSuggestionId: string | null = null;
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
+  private readonly launchedWatcherPids = new Map<string, number>();
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -479,7 +480,7 @@ export default class AiReviewPlugin extends Plugin {
     });
     this.refreshActiveEditorDecorations();
     const suffix = replacedCount > 0 ? ` Replaced ${replacedCount} overlapping suggestion(s).` : "";
-    await this.maybeLaunchCodexForFile(view.file, requestFile, responseFile, launchGuideFile);
+    await this.maybeLaunchCodexWatcherForFile(view.file);
     new Notice(`Created Codex request.${suffix} Response expected in ${this.settings.responsesFolder}.`);
     console.info("AI Review request file:", requestFile);
   }
@@ -868,12 +869,7 @@ export default class AiReviewPlugin extends Plugin {
     return overlapping.length;
   }
 
-  private async maybeLaunchCodexForFile(
-    file: TFile,
-    requestPath: string,
-    responsePath: string,
-    launchGuidePath: string
-  ): Promise<void> {
+  private async maybeLaunchCodexWatcherForFile(file: TFile): Promise<void> {
     if (!this.settings.autoLaunchCodex) {
       return;
     }
@@ -889,32 +885,29 @@ export default class AiReviewPlugin extends Plugin {
       return;
     }
     const normalizedFolder = nodePath.normalize(noteFolder);
+    if (this.isWatcherRunningForFolder(normalizedFolder)) {
+      return;
+    }
 
     const vaultBase = this.getVaultBasePath();
     if (!vaultBase) {
       return;
     }
 
-    const absoluteRequestPath = nodePath.join(vaultBase, requestPath);
-    const absoluteResponsePath = nodePath.join(vaultBase, responsePath);
-    const absoluteLaunchGuidePath = nodePath.join(vaultBase, launchGuidePath);
     const resolvedCodexCommand = this.resolveCodexCliCommand();
     if (!resolvedCodexCommand) {
       new Notice("AI Review could not find a Codex CLI executable. Set an explicit Codex CLI command in plugin settings.");
       return;
     }
-    const codexPrompt = [
-      "An Obsidian AI Review request is waiting.",
-      `Read this launch guide first: ${absoluteLaunchGuidePath}`,
-      `Request JSON: ${absoluteRequestPath}`,
-      `Write response JSON to: ${absoluteResponsePath}`,
-      "Stay in this folder, help the user interactively, and produce exactly the response schema the plugin expects."
-    ].join(" ");
-    const powerShellCommand = [
-      `$Host.UI.RawUI.WindowTitle = 'AI Review Codex'`,
-      `Write-Host 'AI Review launch guide: ${escapeForPowerShellSingleQuotedString(absoluteLaunchGuidePath)}'`,
-      `& '${escapeForPowerShellSingleQuotedString(resolvedCodexCommand)}' -C '${escapeForPowerShellSingleQuotedString(normalizedFolder)}' '${escapeForPowerShellSingleQuotedString(codexPrompt)}'`
-    ].join("; ");
+
+    const watcherScriptPath = await this.persistence.writeWatcherScript(buildCodexWatcherScript());
+    const responseSchemaPath = await this.persistence.writeResponseSchema(
+      JSON.stringify(buildCodexResponseJsonSchema(), null, 2)
+    );
+    const absoluteWatcherScriptPath = nodePath.join(vaultBase, watcherScriptPath);
+    const absoluteRequestsPath = nodePath.join(vaultBase, this.settings.requestsFolder);
+    const absoluteResponsesPath = nodePath.join(vaultBase, this.settings.responsesFolder);
+    const absoluteSchemaPath = nodePath.join(vaultBase, responseSchemaPath);
 
     try {
       const childProcess = window.require("child_process") as {
@@ -922,7 +915,7 @@ export default class AiReviewPlugin extends Plugin {
           command: string,
           args: string[],
           options?: { detached?: boolean; stdio?: string; windowsHide?: boolean }
-        ) => { unref?: () => void };
+        ) => { unref?: () => void; pid?: number };
       };
       const child = childProcess.spawn(
         "cmd.exe",
@@ -934,8 +927,22 @@ export default class AiReviewPlugin extends Plugin {
           normalizedFolder,
           "powershell.exe",
           "-NoExit",
-          "-Command",
-          powerShellCommand
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          absoluteWatcherScriptPath,
+          "-VaultBasePath",
+          vaultBase,
+          "-NoteFolder",
+          normalizedFolder,
+          "-RequestsFolder",
+          absoluteRequestsPath,
+          "-ResponsesFolder",
+          absoluteResponsesPath,
+          "-ResponseSchemaPath",
+          absoluteSchemaPath,
+          "-CodexCommand",
+          resolvedCodexCommand
         ],
         {
           detached: true,
@@ -944,9 +951,27 @@ export default class AiReviewPlugin extends Plugin {
         }
       );
       child.unref?.();
+      if (typeof child.pid === "number" && child.pid > 0) {
+        this.launchedWatcherPids.set(normalizedFolder, child.pid);
+      }
     } catch (error) {
       console.error("AI Review could not launch Codex terminal.", error);
-      new Notice("AI Review could not auto-launch Codex. Check the Codex CLI command in settings.");
+      new Notice("AI Review could not auto-launch the Codex watcher. Check the Codex CLI command in settings.");
+    }
+  }
+
+  private isWatcherRunningForFolder(folderPath: string): boolean {
+    const pid = this.launchedWatcherPids.get(folderPath);
+    if (!pid) {
+      return false;
+    }
+
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      this.launchedWatcherPids.delete(folderPath);
+      return false;
     }
   }
 
@@ -1564,8 +1589,184 @@ function buildCodexLaunchGuide(
   ].join("\n");
 }
 
-function escapeForPowerShellSingleQuotedString(value: string): string {
-  return value.replace(/'/g, "''");
+function buildCodexResponseJsonSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["schemaVersion", "requestId", "notePath", "baseHash", "generator", "suggestion"],
+    properties: {
+      schemaVersion: { const: 1 },
+      requestId: { type: "string" },
+      notePath: { type: "string" },
+      baseHash: { type: "string" },
+      generator: {
+        type: "object",
+        additionalProperties: false,
+        required: ["source", "model", "generatedAt"],
+        properties: {
+          source: { const: "codex" },
+          model: { type: "string" },
+          generatedAt: { type: "string" }
+        }
+      },
+      suggestion: {
+        type: "object",
+        additionalProperties: false,
+        required: ["newText"],
+        properties: {
+          newText: { type: "string" },
+          rationale: { type: "string" }
+        }
+      }
+    }
+  };
+}
+
+function buildCodexWatcherScript(): string {
+  return [
+    "param(",
+    "  [Parameter(Mandatory=$true)][string]$VaultBasePath,",
+    "  [Parameter(Mandatory=$true)][string]$NoteFolder,",
+    "  [Parameter(Mandatory=$true)][string]$RequestsFolder,",
+    "  [Parameter(Mandatory=$true)][string]$ResponsesFolder,",
+    "  [Parameter(Mandatory=$true)][string]$ResponseSchemaPath,",
+    "  [Parameter(Mandatory=$true)][string]$CodexCommand",
+    ")",
+    "",
+    "$ErrorActionPreference = 'Continue'",
+    "",
+    "function Log([string]$Message) {",
+    "  Write-Host \"[AI Review Watcher] $Message\"",
+    "}",
+    "",
+    "function Normalize([string]$PathValue) {",
+    "  try {",
+    "    return [System.IO.Path]::GetFullPath($PathValue)",
+    "  } catch {",
+    "    return $PathValue",
+    "  }",
+    "}",
+    "",
+    "function Get-RequestIdFromPath([string]$PathValue) {",
+    "  return [System.IO.Path]::GetFileName($PathValue) -replace '\\.request\\.json$', ''",
+    "}",
+    "",
+    "function Clean-JsonText([string]$RawText) {",
+    "  if (-not $RawText) {",
+    "    return ''",
+    "  }",
+    "  $trimmed = $RawText.Trim()",
+    "  if ($trimmed.StartsWith('```')) {",
+    "    $trimmed = [regex]::Replace($trimmed, '^```(?:json)?\\s*', '')",
+    "    $trimmed = [regex]::Replace($trimmed, '\\s*```$', '')",
+    "  }",
+    "  return $trimmed.Trim()",
+    "}",
+    "",
+    "function Invoke-Request([string]$RequestPath) {",
+    "  $requestId = Get-RequestIdFromPath $RequestPath",
+    "  $lockPath = Join-Path $RequestsFolder \"$requestId.processing.lock\"",
+    "  $donePath = Join-Path $RequestsFolder \"$requestId.done\"",
+    "  $responsePath = Join-Path $ResponsesFolder \"$requestId.response.json\"",
+    "  $templatePath = Join-Path $ResponsesFolder \"$requestId.response.template.json\"",
+    "  $guidePath = Join-Path $RequestsFolder \"$requestId.launch.md\"",
+    "  $tempOutputPath = Join-Path $ResponsesFolder \"$requestId.codex-output.json\"",
+    "  $errorPath = Join-Path $ResponsesFolder \"$requestId.error.log\"",
+    "",
+    "  if (Test-Path $donePath -or Test-Path $responsePath -or Test-Path $lockPath) {",
+    "    return",
+    "  }",
+    "",
+    "  try {",
+    "    $requestRaw = Get-Content -LiteralPath $RequestPath -Raw",
+    "    $request = $requestRaw | ConvertFrom-Json",
+    "  } catch {",
+    "    Log \"Skipping unreadable request: $RequestPath\"",
+    "    return",
+    "  }",
+    "",
+    "  $notePath = Join-Path $VaultBasePath $request.notePath",
+    "  $requestNoteFolder = Split-Path -Parent $notePath",
+    "  if ((Normalize $requestNoteFolder) -ne (Normalize $NoteFolder)) {",
+    "    return",
+    "  }",
+    "",
+    "  New-Item -ItemType File -Path $lockPath -Force | Out-Null",
+    "  try {",
+    "    Log \"Processing $requestId\"",
+    "    $prompt = @\"",
+    "Process one Obsidian AI Review request.",
+    "",
+    "Read these files first:",
+    "- Request JSON: $RequestPath",
+    "- Full note markdown: $notePath",
+    "- Launch guide: $guidePath",
+    "- Response template: $templatePath",
+    "",
+    "Requirements:",
+    "- Read the full note before drafting the replacement.",
+    "- Produce exactly one JSON object that matches the response schema.",
+    "- Return raw JSON only. No markdown fences. No commentary.",
+    "- Preserve citation markers, equations, units, markdown, and claim scope unless the request itself implies a change.",
+    "\"@",
+    "",
+    "    & $CodexCommand exec -C $NoteFolder --skip-git-repo-check --output-schema $ResponseSchemaPath -o $tempOutputPath $prompt | Out-Null",
+    "",
+    "    if (-not (Test-Path $tempOutputPath)) {",
+    "      throw \"Codex did not write an output file.\"",
+    "    }",
+    "",
+    "    $rawOutput = Get-Content -LiteralPath $tempOutputPath -Raw",
+    "    $jsonText = Clean-JsonText $rawOutput",
+    "    $parsed = $jsonText | ConvertFrom-Json",
+    "",
+    "    if (-not $parsed.generator.generatedAt) {",
+    "      $parsed.generator.generatedAt = (Get-Date).ToString(\"o\")",
+    "    }",
+    "    if (-not $parsed.generator.source) {",
+    "      $parsed.generator.source = 'codex'",
+    "    }",
+    "    if (-not $parsed.generator.model) {",
+    "      $parsed.generator.model = 'codex'",
+    "    }",
+    "",
+    "    $parsed | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $responsePath -Encoding UTF8",
+    "    New-Item -ItemType File -Path $donePath -Force | Out-Null",
+    "    if (Test-Path $errorPath) {",
+    "      Remove-Item -LiteralPath $errorPath -Force",
+    "    }",
+    "    Log \"Wrote response for $requestId\"",
+    "  } catch {",
+    "    $_ | Out-String | Set-Content -LiteralPath $errorPath -Encoding UTF8",
+    "    Log \"Failed $requestId. See $errorPath\"",
+    "  } finally {",
+    "    if (Test-Path $tempOutputPath) {",
+    "      Remove-Item -LiteralPath $tempOutputPath -Force",
+    "    }",
+    "    if (Test-Path $lockPath) {",
+    "      Remove-Item -LiteralPath $lockPath -Force",
+    "    }",
+    "  }",
+    "}",
+    "",
+    "Log \"Watching requests in $RequestsFolder for note folder $NoteFolder\"",
+    "while ($true) {",
+    "  try {",
+    "    if (-not (Test-Path $RequestsFolder)) {",
+    "      Start-Sleep -Seconds 2",
+    "      continue",
+    "    }",
+    "    Get-ChildItem -LiteralPath $RequestsFolder -Filter *.request.json -File -ErrorAction SilentlyContinue |",
+    "      Sort-Object LastWriteTime, Name |",
+    "      ForEach-Object {",
+    "        Invoke-Request $_.FullName",
+    "      }",
+    "  } catch {",
+    "    Log (\"Watcher loop error: \" + ($_ | Out-String))",
+    "  }",
+    "  Start-Sleep -Seconds 2",
+    "}"
+  ].join("\n");
 }
 
 function parseCodexSelectionResponse(raw: unknown): CodexSelectionResponse {

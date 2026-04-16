@@ -41,6 +41,16 @@ export class ReviewPersistence {
     return normalizePath(`${settings.requestsFolder}/${requestId}.launch.md`);
   }
 
+  getWatcherScriptPath(): string {
+    const settings = this.getSettings();
+    return normalizePath(`${settings.reviewsFolder}/watch-review-inbox.ps1`);
+  }
+
+  getResponseSchemaPath(): string {
+    const settings = this.getSettings();
+    return normalizePath(`${settings.reviewsFolder}/codex-response-schema.json`);
+  }
+
   async readReviewState(notePath: string): Promise<ReviewState | null> {
     const reviewPath = this.getReviewFilePath(notePath);
     const adapter = this.app.vault.adapter;
@@ -100,6 +110,20 @@ export class ReviewPersistence {
 
   async writeLaunchGuide(requestId: string, content: string): Promise<string> {
     const path = this.getLaunchGuideFilePath(requestId);
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, content);
+    return path;
+  }
+
+  async writeWatcherScript(content: string): Promise<string> {
+    const path = this.getWatcherScriptPath();
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, content);
+    return path;
+  }
+
+  async writeResponseSchema(content: string): Promise<string> {
+    const path = this.getResponseSchemaPath();
     await this.ensureParentFolder(path);
     await this.app.vault.adapter.write(path, content);
     return path;

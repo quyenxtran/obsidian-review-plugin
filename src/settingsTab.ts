@@ -42,7 +42,7 @@ export class AiReviewSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Auto-launch Codex")
-      .setDesc("When enabled, opening a new request launches a Codex terminal in the note folder if this plugin has not launched one there yet.")
+      .setDesc("When enabled, the plugin starts one long-lived Codex watcher terminal per note folder and lets it process queued requests.")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.autoLaunchCodex)
@@ -54,7 +54,7 @@ export class AiReviewSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Codex CLI command")
-      .setDesc("Command used to start the terminal Codex session.")
+      .setDesc("Command used by the watcher terminal to run Codex.")
       .addText((text) =>
         text
           .setPlaceholder("codex")
