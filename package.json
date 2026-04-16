@@ -1,0 +1,18 @@
+{
+  "name": "obsidian-review-plugin",
+  "version": "0.1.0",
+  "description": "DOCX-style AI suggestion review with accept/reject for Obsidian.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.57",
+    "esbuild": "^0.25.5",
+    "obsidian": "^1.8.10",
+    "typescript": "^5.8.3"
+  }
+}
+

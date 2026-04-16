@@ -1,0 +1,58 @@
+.ai-review-inline-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.ai-review-inline-controls button {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.ai-review-inline-controls button:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.ai-review-inline-controls button:disabled {
+  opacity: 0.5;
+}
+
+.ai-review-delete-mark {
+  background-color: color-mix(in srgb, var(--color-red) 25%, transparent);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.ai-review-insert-preview {
+  border-radius: 4px;
+  background-color: color-mix(in srgb, var(--color-green) 22%, transparent);
+  color: var(--text-normal);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.ai-review-status-pill {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 10px;
+  padding: 1px 6px;
+  text-transform: uppercase;
+}
+
+.ai-review-status-stale {
+  background-color: color-mix(in srgb, var(--color-yellow) 20%, transparent);
+}
+
+.ai-review-status-conflict {
+  background-color: color-mix(in srgb, var(--color-orange) 22%, transparent);
+}

@@ -1,0 +1,11 @@
+{
+  "id": "ai-review",
+  "name": "AI Review",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "DOCX-style AI suggestion review with per-change accept/reject in Obsidian.",
+  "author": "qtran47",
+  "authorUrl": "https://github.com/quyenxtran",
+  "isDesktopOnly": true
+}
+
