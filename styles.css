@@ -1,10 +1,11 @@
 .ai-review-inline-controls {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 4px;
   margin-left: 6px;
   vertical-align: middle;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .ai-review-inline-controls button {
@@ -32,12 +33,16 @@
 }
 
 .ai-review-insert-preview {
+  display: inline-block;
   border-radius: 4px;
   background-color: color-mix(in srgb, var(--color-green) 22%, transparent);
   color: var(--text-normal);
   font-size: 11px;
-  line-height: 1;
+  line-height: 1.35;
+  max-width: min(56rem, 100%);
   padding: 2px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .ai-review-status-pill {
@@ -55,4 +60,18 @@
 
 .ai-review-status-conflict {
   background-color: color-mix(in srgb, var(--color-orange) 22%, transparent);
+}
+
+.ai-review-edit-modal textarea.ai-review-edit-textarea {
+  width: 100%;
+  min-height: 14rem;
+  margin-top: 0.75rem;
+  resize: vertical;
+}
+
+.ai-review-edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
 }

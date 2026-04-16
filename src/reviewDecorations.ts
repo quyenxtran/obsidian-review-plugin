@@ -15,6 +15,8 @@ export type SuggestionAction = "accept" | "reject";
 export interface ReviewDecorationHost {
   getRenderableSuggestions(): Suggestion[];
   onSuggestionAction(id: string, action: SuggestionAction): Promise<void> | void;
+  onSuggestionEdit(id: string): Promise<void> | void;
+  onEditorDocumentChanged(update: ViewUpdate): Promise<void> | void;
 }
 
 export const refreshReviewEffect = StateEffect.define<void>();
@@ -32,6 +34,9 @@ export function createReviewDecorationsExtension(host: ReviewDecorationHost) {
         const hasRefreshEffect = update.transactions.some((tr) =>
           tr.effects.some((effect) => effect.is(refreshReviewEffect))
         );
+        if (update.docChanged) {
+          void host.onEditorDocumentChanged(update);
+        }
         if (update.docChanged || update.viewportChanged || hasRefreshEffect) {
           this.decorations = buildDecorationSet(update.view, host);
         }
@@ -114,7 +119,7 @@ class SuggestionControlsWidget extends WidgetType {
     if (this.suggestion.newText.length > 0) {
       const insertionPreview = document.createElement("span");
       insertionPreview.className = "ai-review-insert-preview";
-      insertionPreview.textContent = `+ ${truncateText(this.suggestion.newText, 60)}`;
+      insertionPreview.textContent = this.suggestion.newText;
       container.appendChild(insertionPreview);
     }
 
@@ -144,18 +149,20 @@ class SuggestionControlsWidget extends WidgetType {
       void this.host.onSuggestionAction(this.suggestion.id, "reject");
     };
 
+    const editButton = document.createElement("button");
+    editButton.textContent = "Edit";
+    editButton.disabled = !isPending;
+    editButton.className = "ai-review-edit-button";
+    editButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.host.onSuggestionEdit(this.suggestion.id);
+    };
+
+    container.appendChild(editButton);
     container.appendChild(acceptButton);
     container.appendChild(rejectButton);
 
     return container;
   }
 }
-
-function truncateText(value: string, maxLength: number): string {
-  const normalized = value.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
-  }
-  return `${normalized.slice(0, maxLength - 1)}...`;
-}
-

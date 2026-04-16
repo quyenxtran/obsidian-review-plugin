@@ -39,6 +39,7 @@ export interface ReviewState {
 
 export type ReviewActionType =
   | "import"
+  | "edit"
   | "accept"
   | "reject"
   | "accept_all"
