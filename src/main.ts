@@ -556,8 +556,9 @@ export default class AiReviewPlugin extends Plugin {
     }
     return this.currentReviewState.suggestions.filter((suggestion) => {
       return (
-        suggestion.status === "pending" ||
-        suggestion.status === "conflict"
+        (suggestion.status === "pending" ||
+          suggestion.status === "conflict") &&
+        suggestion.newText.trim().length > 0
       );
     });
   }
@@ -775,10 +776,7 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private async openCurrentSuggestionModal(): Promise<void> {
-    const suggestion =
-      this.getCurrentPendingSuggestion() ??
-      this.currentReviewState?.suggestions.find((item) => item.status === "conflict") ??
-      null;
+    const suggestion = this.getLatestActionableSuggestion();
 
     if (!suggestion) {
       new Notice("No pending or conflicted suggestion is available.");
@@ -789,10 +787,7 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private maybeSurfacePendingSuggestion(): void {
-    const suggestion =
-      this.getCurrentPendingSuggestion() ??
-      this.currentReviewState?.suggestions.find((item) => item.status === "conflict") ??
-      null;
+    const suggestion = this.getLatestActionableSuggestion();
 
     if (!suggestion) {
       this.lastSurfacedSuggestionId = null;
@@ -1429,7 +1424,7 @@ export default class AiReviewPlugin extends Plugin {
       return [];
     }
     return this.currentReviewState.suggestions
-      .filter((suggestion) => suggestion.status === "pending")
+      .filter((suggestion) => suggestion.status === "pending" && suggestion.newText.trim().length > 0)
       .sort((a, b) => {
         if (a.start !== b.start) {
           return a.start - b.start;
@@ -1492,6 +1487,27 @@ export default class AiReviewPlugin extends Plugin {
     if (next) {
       this.jumpToSuggestion(next);
     }
+  }
+
+  private getLatestActionableSuggestion(): Suggestion | null {
+    if (!this.currentReviewState) {
+      return null;
+    }
+
+    const actionable = this.currentReviewState.suggestions
+      .filter((suggestion) => {
+        if (suggestion.newText.trim().length === 0) {
+          return false;
+        }
+        return suggestion.status === "pending" || suggestion.status === "conflict";
+      })
+      .sort((a, b) => {
+        const timeA = Date.parse(a.createdAt || "");
+        const timeB = Date.parse(b.createdAt || "");
+        return timeB - timeA;
+      });
+
+    return actionable[0] ?? null;
   }
 
   private rebasePendingSuggestionsAfterAccepted(
