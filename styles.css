@@ -1,0 +1,21 @@
+.ai-review-inline-controls {
+  display: inline-flex;
+  gap: 4px;
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
+.ai-review-inline-controls button {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  background-color: var(--background-secondary);
+  color: var(--text-normal);
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+
+.ai-review-inline-controls button:hover {
+  background-color: var(--background-modifier-hover);
+}
+
