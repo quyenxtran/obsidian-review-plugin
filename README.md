@@ -44,16 +44,16 @@ Both paths are configurable in plugin settings.
 ## Terminal Codex Flow
 1. In Obsidian, select text in a note.
 2. Run `AI Review: Request Codex suggestion for selection`.
-3. If auto-launch is enabled, the plugin opens a Codex terminal in the same folder as the active markdown file the first time it needs one in that folder.
+3. If auto-launch is enabled, the plugin opens a fresh Codex terminal in the same folder as the active markdown file for each new request.
 4. The plugin writes a request JSON file into `.obsidian/ai-review/requests/`.
 5. The plugin also writes a launch guide and a response template so the spawned Codex terminal has the exact schema and file targets available immediately.
-6. In terminal Codex, read the guide, then write a matching response JSON into `.obsidian/ai-review/responses/`.
+6. In terminal Codex, read the guide, read the full note for context, then write a matching response JSON into `.obsidian/ai-review/responses/`.
 7. The plugin polls for responses and converts them into inline pending suggestions automatically.
 8. Accept, reject, or edit the inline suggestion in Obsidian.
 
 ## Auto-launch Notes
 - Current implementation is Windows-first.
-- Launch detection is session-local: if the plugin has already launched a Codex terminal for a note folder during the current Obsidian session, it will not launch another one for that folder.
+- The current implementation launches a fresh Codex terminal per request instead of trying to inject new prompts into an already-running interactive Codex session.
 - You can disable this behavior in plugin settings.
 
 ## Request Schema (v1)

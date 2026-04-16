@@ -28,7 +28,6 @@ export default class AiReviewPlugin extends Plugin {
   selectedSuggestionId: string | null = null;
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
-  private readonly launchedCodexFolders = new Set<string>();
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -426,13 +425,20 @@ export default class AiReviewPlugin extends Plugin {
     this.selectedSuggestionId = suggestion.id;
     const requestFile = await this.persistence.writeSelectionRequest(request);
     const responseFile = this.persistence.getResponseFilePath(requestId);
+    const absoluteNotePath = this.getAbsoluteNotePath(view.file);
     const responseTemplateFile = await this.persistence.writeResponseTemplate(
       requestId,
       buildCodexResponseTemplate(request)
     );
     const launchGuideFile = await this.persistence.writeLaunchGuide(
       requestId,
-      buildCodexLaunchGuide(request, requestFile, responseFile, responseTemplateFile)
+      buildCodexLaunchGuide(
+        request,
+        requestFile,
+        responseFile,
+        responseTemplateFile,
+        absoluteNotePath
+      )
     );
     const reviewFile = await this.persistence.writeReviewState(state);
     await this.persistence.appendAuditEvent({
@@ -858,9 +864,6 @@ export default class AiReviewPlugin extends Plugin {
       return;
     }
     const normalizedFolder = nodePath.normalize(noteFolder);
-    if (this.launchedCodexFolders.has(normalizedFolder)) {
-      return;
-    }
 
     const vaultBase = this.getVaultBasePath();
     if (!vaultBase) {
@@ -916,7 +919,6 @@ export default class AiReviewPlugin extends Plugin {
         }
       );
       child.unref?.();
-      this.launchedCodexFolders.add(normalizedFolder);
     } catch (error) {
       console.error("AI Review could not launch Codex terminal.", error);
       new Notice("AI Review could not auto-launch Codex. Check the Codex CLI command in settings.");
@@ -976,6 +978,14 @@ export default class AiReviewPlugin extends Plugin {
       return vaultBase;
     }
     return nodePath.join(vaultBase, relativeDir);
+  }
+
+  private getAbsoluteNotePath(file: TFile): string | null {
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) {
+      return null;
+    }
+    return nodePath.join(vaultBase, file.path);
   }
 
   private async markSuggestionRejected(suggestion: Suggestion): Promise<void> {
@@ -1473,7 +1483,8 @@ function buildCodexLaunchGuide(
   request: CodexSelectionRequest,
   requestFile: string,
   responseFile: string,
-  responseTemplateFile: string
+  responseTemplateFile: string,
+  absoluteNotePath: string | null
 ): string {
   return [
     "# AI Review Codex Launch Guide",
@@ -1481,6 +1492,7 @@ function buildCodexLaunchGuide(
     "You were launched by the Obsidian AI Review plugin.",
     "",
     "## Task",
+    "- Read the full note first so you have whole-document context before suggesting an edit.",
     "- Read the request JSON.",
     "- Work with the user interactively in this terminal if they want to refine the edit.",
     "- When ready, write the final response JSON to the exact response path below.",
@@ -1490,6 +1502,7 @@ function buildCodexLaunchGuide(
     `- Request JSON: ${requestFile}`,
     `- Response JSON to write: ${responseFile}`,
     `- Response template JSON: ${responseTemplateFile}`,
+    `- Full note path: ${absoluteNotePath ?? request.notePath}`,
     "",
     "## Request Summary",
     `- Request ID: ${request.requestId}`,
