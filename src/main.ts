@@ -963,7 +963,7 @@ export default class AiReviewPlugin extends Plugin {
   private isWatcherRunningForFolder(folderPath: string): boolean {
     const pid = this.launchedWatcherPids.get(folderPath);
     if (!pid) {
-      return false;
+      return this.detectExistingWatcherForFolder(folderPath);
     }
 
     try {
@@ -971,6 +971,41 @@ export default class AiReviewPlugin extends Plugin {
       return true;
     } catch {
       this.launchedWatcherPids.delete(folderPath);
+      return this.detectExistingWatcherForFolder(folderPath);
+    }
+  }
+
+  private detectExistingWatcherForFolder(folderPath: string): boolean {
+    if (process.platform !== "win32" || typeof window.require !== "function") {
+      return false;
+    }
+
+    try {
+      const childProcess = window.require("child_process") as {
+        execFileSync: (
+          command: string,
+          args: string[],
+          options?: { encoding?: BufferEncoding; windowsHide?: boolean }
+        ) => string;
+      };
+      const escapedFolderPath = folderPath.replace(/'/g, "''");
+      const script = [
+        `$folder = '${escapedFolderPath}'`,
+        "Get-CimInstance Win32_Process |",
+        "Where-Object {",
+        "  $_.Name -match 'powershell' -and",
+        "  $_.CommandLine -match 'watch-review-inbox\\.ps1' -and",
+        "  $_.CommandLine -like ('*' + $folder + '*')",
+        "} |",
+        "Select-Object -First 1 -ExpandProperty ProcessId"
+      ].join(" ");
+      const output = childProcess.execFileSync(
+        "powershell.exe",
+        ["-NoProfile", "-NonInteractive", "-Command", script],
+        { encoding: "utf8", windowsHide: true }
+      ).trim();
+      return Boolean(output);
+    } catch {
       return false;
     }
   }
@@ -1612,7 +1647,7 @@ function buildCodexResponseJsonSchema(): Record<string, unknown> {
       suggestion: {
         type: "object",
         additionalProperties: false,
-        required: ["newText"],
+        required: ["newText", "rationale"],
         properties: {
           newText: { type: "string" },
           rationale: { type: "string" }
