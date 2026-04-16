@@ -15,6 +15,7 @@ export type SuggestionAction = "accept" | "reject";
 export interface ReviewDecorationHost {
   getRenderableSuggestions(): Suggestion[];
   onSuggestionAction(id: string, action: SuggestionAction): Promise<void> | void;
+  onSuggestionEdit(id: string): Promise<void> | void;
 }
 
 export const refreshReviewEffect = StateEffect.define<void>();
@@ -114,7 +115,7 @@ class SuggestionControlsWidget extends WidgetType {
     if (this.suggestion.newText.length > 0) {
       const insertionPreview = document.createElement("span");
       insertionPreview.className = "ai-review-insert-preview";
-      insertionPreview.textContent = `+ ${this.suggestion.newText}`;
+      insertionPreview.textContent = this.suggestion.newText;
       container.appendChild(insertionPreview);
     }
 
@@ -144,6 +145,17 @@ class SuggestionControlsWidget extends WidgetType {
       void this.host.onSuggestionAction(this.suggestion.id, "reject");
     };
 
+    const editButton = document.createElement("button");
+    editButton.textContent = "Edit";
+    editButton.disabled = !isPending;
+    editButton.className = "ai-review-edit-button";
+    editButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.host.onSuggestionEdit(this.suggestion.id);
+    };
+
+    container.appendChild(editButton);
     container.appendChild(acceptButton);
     container.appendChild(rejectButton);
 

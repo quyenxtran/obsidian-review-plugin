@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, normalizePath } from "obsidian";
+import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { sha256 } from "./hash";
 import { ReviewPersistence } from "./persistence";
 import {
@@ -374,6 +374,46 @@ export default class AiReviewPlugin extends Plugin {
     this.selectFallbackSuggestion();
   }
 
+  async onSuggestionEdit(id: string): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      new Notice("No review state loaded for this note.");
+      return;
+    }
+
+    const suggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+    if (!suggestion) {
+      new Notice(`Suggestion ${id} was not found.`);
+      return;
+    }
+    if (suggestion.status !== "pending") {
+      new Notice(`Only pending suggestions can be edited.`);
+      return;
+    }
+
+    const editedText = await this.openSuggestionEditModal(suggestion);
+    if (editedText === null || editedText === suggestion.newText) {
+      return;
+    }
+
+    suggestion.newText = editedText;
+    this.currentReviewState.updatedAt = new Date().toISOString();
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "edit",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: this.currentReviewState.updatedAt,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      fromStatus: suggestion.status,
+      toStatus: suggestion.status,
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash
+    });
+    this.refreshActiveEditorDecorations();
+    new Notice(`Updated suggestion ${suggestion.id}.`);
+  }
+
   private refreshActiveEditorDecorations(): void {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     const cm = (view?.editor as unknown as { cm?: { dispatch: (spec: unknown) => void } }).cm;
@@ -382,6 +422,12 @@ export default class AiReviewPlugin extends Plugin {
     }
     cm.dispatch({
       effects: [refreshReviewEffect.of(undefined)]
+    });
+  }
+
+  private async openSuggestionEditModal(suggestion: Suggestion): Promise<string | null> {
+    return await new Promise<string | null>((resolve) => {
+      new EditSuggestionModal(this.app, suggestion.newText, resolve).open();
     });
   }
 
@@ -697,6 +743,60 @@ export default class AiReviewPlugin extends Plugin {
     }
 
     return conflicts;
+  }
+}
+
+class EditSuggestionModal extends Modal {
+  constructor(
+    app: Plugin["app"],
+    private readonly initialText: string,
+    private readonly onResolve: (value: string | null) => void
+  ) {
+    super(app);
+  }
+
+  override onOpen(): void {
+    const { contentEl, modalEl } = this;
+    modalEl.addClass("ai-review-edit-modal");
+    contentEl.empty();
+    contentEl.createEl("h2", { text: "Edit suggestion" });
+
+    const textarea = contentEl.createEl("textarea", {
+      cls: "ai-review-edit-textarea"
+    });
+    textarea.value = this.initialText;
+    textarea.rows = 10;
+    textarea.focus();
+    textarea.select();
+
+    const buttonRow = contentEl.createDiv({ cls: "ai-review-edit-actions" });
+
+    const cancelButton = buttonRow.createEl("button", { text: "Cancel" });
+    cancelButton.onclick = () => {
+      this.onResolve(null);
+      this.close();
+    };
+
+    const saveButton = buttonRow.createEl("button", {
+      text: "Save",
+      cls: "mod-cta"
+    });
+    saveButton.onclick = () => {
+      this.onResolve(textarea.value);
+      this.close();
+    };
+
+    textarea.addEventListener("keydown", (event) => {
+      if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+        event.preventDefault();
+        this.onResolve(textarea.value);
+        this.close();
+      }
+    });
+  }
+
+  override onClose(): void {
+    this.contentEl.empty();
   }
 }
 
