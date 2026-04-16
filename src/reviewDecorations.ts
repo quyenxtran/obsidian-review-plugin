@@ -16,6 +16,7 @@ export interface ReviewDecorationHost {
   getRenderableSuggestions(): Suggestion[];
   onSuggestionAction(id: string, action: SuggestionAction): Promise<void> | void;
   onSuggestionEdit(id: string): Promise<void> | void;
+  onSuggestionResolve(id: string): Promise<void> | void;
   onEditorDocumentChanged(update: ViewUpdate): Promise<void> | void;
 }
 
@@ -129,6 +130,7 @@ class SuggestionControlsWidget extends WidgetType {
     container.appendChild(statusLabel);
 
     const isPending = this.suggestion.status === "pending";
+    const isConflict = this.suggestion.status === "conflict";
     const acceptButton = document.createElement("button");
     acceptButton.textContent = "Accept";
     acceptButton.disabled = !isPending;
@@ -141,7 +143,7 @@ class SuggestionControlsWidget extends WidgetType {
 
     const rejectButton = document.createElement("button");
     rejectButton.textContent = "Reject";
-    rejectButton.disabled = !isPending;
+    rejectButton.disabled = !(isPending || isConflict);
     rejectButton.className = "ai-review-reject-button";
     rejectButton.onclick = (event) => {
       event.preventDefault();
@@ -151,7 +153,7 @@ class SuggestionControlsWidget extends WidgetType {
 
     const editButton = document.createElement("button");
     editButton.textContent = "Edit";
-    editButton.disabled = !isPending;
+    editButton.disabled = !(isPending || isConflict);
     editButton.className = "ai-review-edit-button";
     editButton.onclick = (event) => {
       event.preventDefault();
@@ -159,6 +161,17 @@ class SuggestionControlsWidget extends WidgetType {
       void this.host.onSuggestionEdit(this.suggestion.id);
     };
 
+    const resolveButton = document.createElement("button");
+    resolveButton.textContent = "Resolve";
+    resolveButton.disabled = !isConflict;
+    resolveButton.className = "ai-review-resolve-button";
+    resolveButton.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void this.host.onSuggestionResolve(this.suggestion.id);
+    };
+
+    container.appendChild(resolveButton);
     container.appendChild(editButton);
     container.appendChild(acceptButton);
     container.appendChild(rejectButton);

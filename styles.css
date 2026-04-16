@@ -37,8 +37,8 @@
   border-radius: 4px;
   background-color: color-mix(in srgb, var(--color-green) 22%, transparent);
   color: var(--text-normal);
-  font-size: 11px;
-  line-height: 1.35;
+  font: inherit;
+  line-height: inherit;
   max-width: min(56rem, 100%);
   padding: 2px 6px;
   white-space: pre-wrap;

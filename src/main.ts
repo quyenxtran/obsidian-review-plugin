@@ -389,8 +389,8 @@ export default class AiReviewPlugin extends Plugin {
       new Notice(`Suggestion ${id} was not found.`);
       return;
     }
-    if (suggestion.status !== "pending") {
-      new Notice(`Only pending suggestions can be edited.`);
+    if (suggestion.status !== "pending" && suggestion.status !== "conflict") {
+      new Notice(`Only pending or conflicted suggestions can be edited.`);
       return;
     }
 
@@ -416,6 +416,62 @@ export default class AiReviewPlugin extends Plugin {
     });
     this.refreshActiveEditorDecorations();
     new Notice(`Updated suggestion ${suggestion.id}.`);
+  }
+
+  async onSuggestionResolve(id: string): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      new Notice("No review state loaded for this note.");
+      return;
+    }
+
+    const suggestion = this.currentReviewState.suggestions.find((item) => item.id === id);
+    if (!suggestion) {
+      new Notice(`Suggestion ${id} was not found.`);
+      return;
+    }
+    if (suggestion.status !== "conflict") {
+      new Notice(`Suggestion ${id} is not conflicted.`);
+      return;
+    }
+
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new Notice("No active markdown file.");
+      return;
+    }
+
+    const currentText = await this.app.vault.cachedRead(file);
+    const start = Math.max(0, Math.min(suggestion.start, currentText.length));
+    const end = Math.max(start, Math.min(suggestion.end, currentText.length));
+    const currentTarget = currentText.slice(start, end);
+    if (!currentTarget) {
+      new Notice(`Suggestion ${id} cannot be resolved because the current target range is empty.`);
+      return;
+    }
+
+    const previousStatus = suggestion.status;
+    suggestion.start = start;
+    suggestion.end = end;
+    suggestion.expectedOldText = currentTarget;
+    suggestion.status = "pending";
+    suggestion.decidedAt = undefined;
+    suggestion.decidedBy = undefined;
+    this.currentReviewState.updatedAt = new Date().toISOString();
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "resolve",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: this.currentReviewState.updatedAt,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      fromStatus: previousStatus,
+      toStatus: "pending",
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash
+    });
+    this.refreshActiveEditorDecorations();
+    new Notice(`Resolved suggestion ${suggestion.id}. You can accept it now.`);
   }
 
   async onEditorDocumentChanged(update: ViewUpdate): Promise<void> {
@@ -798,6 +854,20 @@ export default class AiReviewPlugin extends Plugin {
       }
 
       if (doesChangeOverlapSuggestion(changes, suggestion)) {
+        const overlapRange = findOverlappingChangedRange(changes, suggestion);
+        const mappedStart = changes.mapPos(suggestion.start, 1, MapMode.Simple);
+        const mappedEnd = changes.mapPos(suggestion.end, -1, MapMode.Simple);
+        if (
+          mappedStart !== null &&
+          mappedEnd !== null &&
+          mappedEnd >= mappedStart
+        ) {
+          suggestion.start = mappedStart;
+          suggestion.end = mappedEnd;
+        } else if (overlapRange) {
+          suggestion.start = overlapRange.fromB;
+          suggestion.end = overlapRange.toB;
+        }
         suggestion.status = "conflict";
         suggestion.decidedAt = timestamp;
         suggestion.decidedBy = this.settings.reviewerName || undefined;
@@ -966,4 +1036,30 @@ function doesChangeOverlapSuggestion(changes: ChangeDesc, suggestion: Suggestion
   });
 
   return overlaps;
+}
+
+function findOverlappingChangedRange(
+  changes: ChangeDesc,
+  suggestion: Suggestion
+): { fromB: number; toB: number } | null {
+  let overlap: { fromB: number; toB: number } | null = null;
+
+  changes.iterChangedRanges((fromA, toA, fromB, toB) => {
+    if (overlap) {
+      return;
+    }
+
+    if (fromA === toA) {
+      if (suggestion.start < fromA && fromA < suggestion.end) {
+        overlap = { fromB, toB };
+      }
+      return;
+    }
+
+    if (suggestion.start < toA && fromA < suggestion.end) {
+      overlap = { fromB, toB };
+    }
+  });
+
+  return overlap;
 }
