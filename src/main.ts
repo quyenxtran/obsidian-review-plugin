@@ -1,4 +1,4 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
+import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath, requestUrl } from "obsidian";
 import { MapMode, type ChangeDesc } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
 import { sha256 } from "./hash";
@@ -41,8 +41,16 @@ export default class AiReviewPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "ai-review-suggest-selection",
+      name: "AI Review: Suggest revision for selection",
+      callback: async () => {
+        await this.generateSuggestionForSelection();
+      }
+    });
+
+    this.addCommand({
       id: "ai-review-import-json",
-      name: "AI Review: Import suggestions from JSON",
+      name: "AI Review: Import suggestions from JSON (legacy)",
       callback: async () => {
         await this.importSuggestionsFromJson();
       }
@@ -322,6 +330,116 @@ export default class AiReviewPlugin extends Plugin {
     });
   }
 
+  private async generateSuggestionForSelection(): Promise<void> {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view?.file) {
+      new Notice("Open a markdown note before generating AI suggestions.");
+      return;
+    }
+
+    const apiKey = this.settings.openAiApiKey.trim();
+    if (!apiKey) {
+      new Notice("Set an OpenAI API key in AI Review settings first.");
+      return;
+    }
+
+    const editor = view.editor;
+    const selectedText = editor.getSelection();
+    if (!selectedText.trim()) {
+      new Notice("Select text in the note first.");
+      return;
+    }
+
+    const selectionStart = editor.posToOffset(editor.getCursor("from"));
+    const selectionEnd = editor.posToOffset(editor.getCursor("to"));
+    if (selectionStart === undefined || selectionEnd === undefined || selectionEnd < selectionStart) {
+      new Notice("Could not determine the selected text range.");
+      return;
+    }
+
+    const notePath = normalizePath(view.file.path);
+    const noteText = editor.getValue();
+    const currentHash = sha256(noteText);
+    const state = await this.ensureReviewStateForNote(notePath, currentHash);
+    const now = new Date().toISOString();
+    const currentTarget = noteText.slice(selectionStart, selectionEnd);
+    if (currentTarget !== selectedText) {
+      new Notice("The selected text changed before generation completed. Try again.");
+      return;
+    }
+
+    const prompt = buildRevisionPrompt(
+      selectedText,
+      noteText.slice(Math.max(0, selectionStart - 500), selectionStart),
+      noteText.slice(selectionEnd, Math.min(noteText.length, selectionEnd + 500)),
+      this.settings.defaultEditInstruction
+    );
+
+    new Notice("Generating AI suggestion...");
+
+    let suggestedText: string;
+    try {
+      suggestedText = await this.requestAiSuggestion(prompt);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "AI request failed.";
+      new Notice(message);
+      return;
+    }
+
+    suggestedText = normalizeAiOutput(suggestedText);
+    if (!suggestedText) {
+      new Notice("AI returned an empty suggestion.");
+      return;
+    }
+    if (suggestedText === selectedText) {
+      new Notice("AI returned no change for the selected text.");
+      return;
+    }
+
+    const replacedCount = await this.replaceOverlappingSuggestions(
+      state,
+      selectionStart,
+      selectionEnd,
+      now
+    );
+    const suggestion: Suggestion = {
+      id: `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      start: selectionStart,
+      end: selectionEnd,
+      expectedOldText: selectedText,
+      newText: suggestedText,
+      status: "pending",
+      createdAt: now
+    };
+
+    state.suggestions.push(suggestion);
+    state.currentHash = currentHash;
+    state.updatedAt = now;
+    if (!state.importedAt) {
+      state.importedAt = now;
+    }
+    this.currentReviewState = state;
+    this.activeNotePath = notePath;
+    this.selectedSuggestionId = suggestion.id;
+    const reviewFile = await this.persistence.writeReviewState(state);
+    await this.persistence.appendAuditEvent({
+      eventType: "generate",
+      notePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      suggestionId: suggestion.id,
+      toStatus: "pending",
+      baseHash: state.baseHash,
+      currentHash: state.currentHash,
+      payloadGenerator: this.settings.openAiModel.trim() || "openai"
+    });
+    this.jumpToSuggestion(suggestion);
+    this.refreshActiveEditorDecorations();
+    const suffix = replacedCount > 0 ? ` Replaced ${replacedCount} overlapping suggestion(s).` : "";
+    new Notice(`Generated AI suggestion for the current selection.${suffix}`);
+  }
+
   async loadStateForActiveFile(): Promise<void> {
     const file = this.getActiveMarkdownFile();
     if (!file) {
@@ -337,6 +455,38 @@ export default class AiReviewPlugin extends Plugin {
     this.selectedSuggestionId =
       this.currentReviewState?.suggestions.find((item) => item.status === "pending")?.id ?? null;
     this.refreshActiveEditorDecorations();
+  }
+
+  private async ensureReviewStateForNote(
+    notePath: string,
+    currentHash: string
+  ): Promise<ReviewState> {
+    if (this.currentReviewState && this.activeNotePath === notePath) {
+      this.currentReviewState.currentHash = currentHash;
+      return this.currentReviewState;
+    }
+
+    const existing = await this.persistence.readReviewState(notePath);
+    if (existing) {
+      existing.currentHash = currentHash;
+      this.currentReviewState = existing;
+      this.activeNotePath = notePath;
+      return existing;
+    }
+
+    const now = new Date().toISOString();
+    const created: ReviewState = {
+      schemaVersion: 1,
+      notePath,
+      baseHash: currentHash,
+      currentHash,
+      suggestions: [],
+      importedAt: now,
+      updatedAt: now
+    };
+    this.currentReviewState = created;
+    this.activeNotePath = notePath;
+    return created;
   }
 
   getRenderableSuggestions(): Suggestion[] {
@@ -520,6 +670,84 @@ export default class AiReviewPlugin extends Plugin {
     return await new Promise<string | null>((resolve) => {
       new EditSuggestionModal(this.app, suggestion.newText, resolve).open();
     });
+  }
+
+  private async requestAiSuggestion(prompt: string): Promise<string> {
+    const endpoint = this.settings.openAiEndpoint.trim() || "https://api.openai.com/v1/responses";
+    const model = this.settings.openAiModel.trim() || "gpt-5.4-mini";
+
+    const response = await requestUrl({
+      url: endpoint,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${this.settings.openAiApiKey.trim()}`,
+        "X-Client-Request-Id": `ai-review-${Date.now()}`
+      },
+      body: JSON.stringify({
+        model,
+        instructions:
+          "You are revising user-selected prose inside an Obsidian note. Return only replacement text for the selected span.",
+        input: prompt
+      })
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      const message = typeof response.text === "string" && response.text.trim()
+        ? response.text
+        : `OpenAI request failed with status ${response.status}.`;
+      throw new Error(message);
+    }
+
+    const outputText = extractResponseOutputText(response.json);
+    if (!outputText) {
+      throw new Error("OpenAI returned no text output.");
+    }
+    return outputText;
+  }
+
+  private async replaceOverlappingSuggestions(
+    state: ReviewState,
+    start: number,
+    end: number,
+    timestamp: string
+  ): Promise<number> {
+    if (!this.activeNotePath) {
+      return 0;
+    }
+
+    const overlapping = state.suggestions.filter((suggestion) => {
+      if (suggestion.status !== "pending" && suggestion.status !== "conflict") {
+        return false;
+      }
+      return rangesOverlap(suggestion.start, suggestion.end, start, end);
+    });
+
+    if (overlapping.length === 0) {
+      return 0;
+    }
+
+    const reviewFile = await this.persistence.writeReviewState(state);
+    for (const suggestion of overlapping) {
+      const fromStatus = suggestion.status;
+      suggestion.status = "rejected";
+      suggestion.decidedAt = timestamp;
+      suggestion.decidedBy = this.settings.reviewerName || undefined;
+      await this.persistence.appendAuditEvent({
+        eventType: "reject",
+        notePath: this.activeNotePath,
+        reviewFile,
+        timestamp,
+        reviewer: this.settings.reviewerName || undefined,
+        suggestionId: suggestion.id,
+        fromStatus,
+        toStatus: "rejected",
+        baseHash: state.baseHash,
+        currentHash: state.currentHash
+      });
+    }
+
+    return overlapping.length;
   }
 
   private async markSuggestionRejected(suggestion: Suggestion): Promise<void> {
@@ -981,6 +1209,69 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function buildRevisionPrompt(
+  selectedText: string,
+  contextBefore: string,
+  contextAfter: string,
+  instruction: string
+): string {
+  return [
+    instruction.trim(),
+    "Revise only the selected text so it fits the surrounding note.",
+    "Preserve citation markers, equations, units, markdown, and claim scope unless the selected text itself requires a minimal correction.",
+    "Return only the revised replacement text.",
+    `Context before:\n${contextBefore || "[none]"}`,
+    `Selected text:\n${selectedText}`,
+    `Context after:\n${contextAfter || "[none]"}`
+  ].join("\n\n");
+}
+
+function normalizeAiOutput(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith("\"") && trimmed.endsWith("\"")) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function extractResponseOutputText(value: unknown): string {
+  if (!isObject(value)) {
+    return "";
+  }
+  if (typeof value.output_text === "string" && value.output_text.trim()) {
+    return value.output_text;
+  }
+
+  const output = value.output;
+  if (!Array.isArray(output)) {
+    return "";
+  }
+
+  const collected: string[] = [];
+  for (const item of output) {
+    if (!isObject(item)) {
+      continue;
+    }
+    const content = item.content;
+    if (!Array.isArray(content)) {
+      continue;
+    }
+    for (const part of content) {
+      if (!isObject(part)) {
+        continue;
+      }
+      if (typeof part.text === "string" && part.text.trim()) {
+        collected.push(part.text);
+      }
+    }
+  }
+
+  return collected.join("\n").trim();
+}
+
 function applySuggestionsDeterministically(
   content: string,
   suggestions: Suggestion[]
@@ -1061,4 +1352,22 @@ function findOverlappingChangedRange(
   });
 
   return overlap;
+}
+
+function rangesOverlap(
+  aStart: number,
+  aEnd: number,
+  bStart: number,
+  bEnd: number
+): boolean {
+  if (aStart === aEnd && bStart === bEnd) {
+    return aStart === bStart;
+  }
+  if (aStart === aEnd) {
+    return bStart <= aStart && aStart <= bEnd;
+  }
+  if (bStart === bEnd) {
+    return aStart <= bStart && bStart <= aEnd;
+  }
+  return aStart < bEnd && bStart < aEnd;
 }

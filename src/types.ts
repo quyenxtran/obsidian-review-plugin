@@ -38,6 +38,7 @@ export interface ReviewState {
 }
 
 export type ReviewActionType =
+  | "generate"
   | "import"
   | "edit"
   | "resolve"
@@ -69,10 +70,19 @@ export interface AiReviewSettings {
   reviewsFolder: string;
   auditLogPath: string;
   reviewerName: string;
+  openAiApiKey: string;
+  openAiEndpoint: string;
+  openAiModel: string;
+  defaultEditInstruction: string;
 }
 
 export const DEFAULT_SETTINGS: AiReviewSettings = {
   reviewsFolder: ".obsidian/ai-review",
   auditLogPath: ".obsidian/ai-review/review-log.ndjson",
-  reviewerName: ""
+  reviewerName: "",
+  openAiApiKey: "",
+  openAiEndpoint: "https://api.openai.com/v1/responses",
+  openAiModel: "gpt-5.4-mini",
+  defaultEditInstruction:
+    "Revise the selected text for clarity, grammar, technical precision, and concision. Preserve meaning, markdown, citations, equations, and notation. Return only the revised replacement text with no commentary or quotation marks."
 };
