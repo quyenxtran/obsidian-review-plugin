@@ -452,17 +452,23 @@ export default class AiReviewPlugin extends Plugin {
     const requestFile = await this.persistence.writeSelectionRequest(request);
     const responseFile = this.persistence.getResponseFilePath(requestId);
     const absoluteNotePath = this.getAbsoluteNotePath(view.file);
+    const vaultBase = this.getVaultBasePath();
+    const absoluteRequestFile = vaultBase ? nodePath.join(vaultBase, requestFile) : requestFile;
+    const absoluteResponseFile = vaultBase ? nodePath.join(vaultBase, responseFile) : responseFile;
     const responseTemplateFile = await this.persistence.writeResponseTemplate(
       requestId,
       buildCodexResponseTemplate(request)
     );
+    const absoluteResponseTemplateFile = vaultBase
+      ? nodePath.join(vaultBase, responseTemplateFile)
+      : responseTemplateFile;
     const launchGuideFile = await this.persistence.writeLaunchGuide(
       requestId,
       buildCodexLaunchGuide(
         request,
-        requestFile,
-        responseFile,
-        responseTemplateFile,
+        absoluteRequestFile,
+        absoluteResponseFile,
+        absoluteResponseTemplateFile,
         absoluteNotePath
       )
     );
@@ -1578,8 +1584,8 @@ function buildCodexLaunchGuide(
     "",
     "## Task",
     "- Read the full note first so you have whole-document context before suggesting an edit.",
-    "- Read the request JSON.",
-    "- Work with the user interactively in this terminal if they want to refine the edit.",
+    "- Read the request JSON and response template.",
+    "- Produce one revision suggestion for the selected span.",
     "- When ready, write the final response JSON to the exact response path below.",
     "- The plugin will import that response automatically.",
     "",
@@ -1620,7 +1626,7 @@ function buildCodexLaunchGuide(
     "- Preserve citation markers, equations, units, markdown, and claim scope unless the user explicitly wants more aggressive edits.",
     "- Fill `generator.model` and `generator.generatedAt` before writing the final response JSON.",
     "- Fill `suggestion.newText` with the replacement text only.",
-    "- `suggestion.rationale` is optional but recommended and should stay short."
+    "- Fill `suggestion.rationale` with a short sentence."
   ].join("\n");
 }
 
@@ -1730,20 +1736,36 @@ function buildCodexWatcherScript(): string {
     "  New-Item -ItemType File -Path $lockPath -Force | Out-Null",
     "  try {",
     "    Log \"Processing $requestId\"",
+    "    if (-not (Test-Path $notePath)) {",
+    "      throw \"Note file not found: $notePath\"",
+    "    }",
+    "    $noteRaw = Get-Content -LiteralPath $notePath -Raw",
+    "    $templateRaw = if (Test-Path $templatePath) { Get-Content -LiteralPath $templatePath -Raw } else { '' }",
+    "    $guideRaw = if (Test-Path $guidePath) { Get-Content -LiteralPath $guidePath -Raw } else { '' }",
     "    $prompt = @\"",
-    "Process one Obsidian AI Review request.",
+    "Generate one Obsidian AI Review response.",
     "",
-    "Read these files first:",
-    "- Request JSON: $RequestPath",
-    "- Full note markdown: $notePath",
-    "- Launch guide: $guidePath",
-    "- Response template: $templatePath",
-    "",
-    "Requirements:",
-    "- Read the full note before drafting the replacement.",
-    "- Produce exactly one JSON object that matches the response schema.",
+    "Important constraints:",
+    "- Do not use tools.",
+    "- Do not run shell commands.",
+    "- Do not read any files.",
+    "- All context you need is included below.",
+    "- Return exactly one JSON object matching the response schema.",
     "- Return raw JSON only. No markdown fences. No commentary.",
     "- Preserve citation markers, equations, units, markdown, and claim scope unless the request itself implies a change.",
+    "- Fill suggestion.rationale with one short sentence.",
+    "",
+    "REQUEST JSON",
+    "$requestRaw",
+    "",
+    "RESPONSE TEMPLATE JSON",
+    "$templateRaw",
+    "",
+    "FULL NOTE MARKDOWN",
+    "$noteRaw",
+    "",
+    "LAUNCH GUIDE",
+    "$guideRaw",
     "\"@",
     "",
     "    & $CodexCommand exec -C $NoteFolder --skip-git-repo-check --disable plugins --ephemeral --color never --output-schema $ResponseSchemaPath -o $tempOutputPath $prompt *> $runLogPath",
