@@ -1,4 +1,4 @@
-import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
+import { Editor, MarkdownView, Menu, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { MapMode, type ChangeDesc } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
 import * as nodePath from "path";
@@ -125,6 +125,28 @@ export default class AiReviewPlugin extends Plugin {
       }
     });
 
+    this.registerEvent(
+      (this.app.workspace as unknown as {
+        on: (
+          name: string,
+          callback: (menu: Menu, editor: Editor, view: MarkdownView) => void
+        ) => unknown;
+      }).on("editor-menu", (menu: Menu, editor: Editor, view: MarkdownView) => {
+        const selectedText = editor.getSelection();
+        if (!selectedText.trim()) {
+          return;
+        }
+
+        menu.addItem((item) => {
+          item
+            .setTitle("AI Review Selection")
+            .setIcon("sparkles")
+            .onClick(() => {
+              void this.createSelectionRequest(view, editor);
+            });
+        });
+      }) as never
+    );
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", async () => {
         await this.loadStateForActiveFile();
@@ -346,14 +368,17 @@ export default class AiReviewPlugin extends Plugin {
     });
   }
 
-  private async createSelectionRequest(): Promise<void> {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+  private async createSelectionRequest(
+    providedView?: MarkdownView,
+    providedEditor?: Editor
+  ): Promise<void> {
+    const view = providedView ?? this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view?.file) {
       new Notice("Open a markdown note before creating a Codex request.");
       return;
     }
 
-    const editor = view.editor;
+    const editor = providedEditor ?? view.editor;
     const selectedText = editor.getSelection();
     if (!selectedText.trim()) {
       new Notice("Select text in the note first.");

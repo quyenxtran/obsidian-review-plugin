@@ -25,6 +25,10 @@ DOCX-style review workflow for AI edits in markdown notes:
 - `AI Review: Accept all pending`
 - `AI Review: Reject all pending`
 
+## Editor UI
+- When text is selected in the editor, the right-click context menu includes `AI Review Selection`.
+- That menu item uses the same request flow as the command palette entry.
+
 ## Data Files
 - Review state sidecars:
   - `.obsidian/ai-review/<sha256(notePath)>.review.json`
