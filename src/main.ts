@@ -870,6 +870,11 @@ export default class AiReviewPlugin extends Plugin {
     const absoluteRequestPath = nodePath.join(vaultBase, requestPath);
     const absoluteResponsePath = nodePath.join(vaultBase, responsePath);
     const absoluteLaunchGuidePath = nodePath.join(vaultBase, launchGuidePath);
+    const resolvedCodexCommand = this.resolveCodexCliCommand();
+    if (!resolvedCodexCommand) {
+      new Notice("AI Review could not find a Codex CLI executable. Set an explicit Codex CLI command in plugin settings.");
+      return;
+    }
     const codexPrompt = [
       "An Obsidian AI Review request is waiting.",
       `Read this launch guide first: ${absoluteLaunchGuidePath}`,
@@ -877,6 +882,11 @@ export default class AiReviewPlugin extends Plugin {
       `Write response JSON to: ${absoluteResponsePath}`,
       "Stay in this folder, help the user interactively, and produce exactly the response schema the plugin expects."
     ].join(" ");
+    const powerShellCommand = [
+      `$Host.UI.RawUI.WindowTitle = 'AI Review Codex'`,
+      `Write-Host 'AI Review launch guide: ${escapeForPowerShellSingleQuotedString(absoluteLaunchGuidePath)}'`,
+      `& '${escapeForPowerShellSingleQuotedString(resolvedCodexCommand)}' -C '${escapeForPowerShellSingleQuotedString(normalizedFolder)}' '${escapeForPowerShellSingleQuotedString(codexPrompt)}'`
+    ].join("; ");
 
     try {
       const childProcess = window.require("child_process") as {
@@ -897,10 +907,7 @@ export default class AiReviewPlugin extends Plugin {
           "powershell.exe",
           "-NoExit",
           "-Command",
-          this.settings.codexCliCommand.trim() || "codex",
-          "-C",
-          normalizedFolder,
-          codexPrompt
+          powerShellCommand
         ],
         {
           detached: true,
@@ -914,6 +921,37 @@ export default class AiReviewPlugin extends Plugin {
       console.error("AI Review could not launch Codex terminal.", error);
       new Notice("AI Review could not auto-launch Codex. Check the Codex CLI command in settings.");
     }
+  }
+
+  private resolveCodexCliCommand(): string | null {
+    const configured = this.settings.codexCliCommand.trim();
+    const fs = window.require?.("fs") as { existsSync?: (path: string) => boolean } | undefined;
+    const existsSync = fs?.existsSync;
+    const candidates = [
+      configured,
+      configured ? `${configured}.cmd` : "",
+      configured ? `${configured}.ps1` : "",
+      process.env.APPDATA
+        ? nodePath.join(process.env.APPDATA, "npm", "codex.cmd")
+        : "",
+      process.env.APPDATA
+        ? nodePath.join(process.env.APPDATA, "npm", "codex.ps1")
+        : "",
+      "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe",
+      "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex"
+    ].filter((value) => Boolean(value));
+
+    if (!existsSync) {
+      return configured || null;
+    }
+
+    for (const candidate of candidates) {
+      if (nodePath.isAbsolute(candidate) && existsSync(candidate)) {
+        return candidate;
+      }
+    }
+
+    return configured || null;
   }
 
   private getVaultBasePath(): string | null {
@@ -1486,6 +1524,10 @@ function buildCodexLaunchGuide(
     "- Fill `suggestion.newText` with the replacement text only.",
     "- `suggestion.rationale` is optional but recommended and should stay short."
   ].join("\n");
+}
+
+function escapeForPowerShellSingleQuotedString(value: string): string {
+  return value.replace(/'/g, "''");
 }
 
 function parseCodexSelectionResponse(raw: unknown): CodexSelectionResponse {
