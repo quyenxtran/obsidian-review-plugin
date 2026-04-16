@@ -1595,7 +1595,7 @@ function buildCodexResponseJsonSchema(): Record<string, unknown> {
     additionalProperties: false,
     required: ["schemaVersion", "requestId", "notePath", "baseHash", "generator", "suggestion"],
     properties: {
-      schemaVersion: { const: 1 },
+      schemaVersion: { type: "integer", const: 1 },
       requestId: { type: "string" },
       notePath: { type: "string" },
       baseHash: { type: "string" },
@@ -1604,7 +1604,7 @@ function buildCodexResponseJsonSchema(): Record<string, unknown> {
         additionalProperties: false,
         required: ["source", "model", "generatedAt"],
         properties: {
-          source: { const: "codex" },
+          source: { type: "string", const: "codex" },
           model: { type: "string" },
           generatedAt: { type: "string" }
         }
