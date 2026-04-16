@@ -738,6 +738,11 @@ export default class AiReviewPlugin extends Plugin {
       return false;
     }
 
+    const citationMarkersPreserved = haveSameCitationMarkers(
+      placeholder.expectedOldText,
+      placeholder.newText
+    );
+
     const currentTarget = noteText.slice(placeholder.start, placeholder.end);
     if (placeholder.status === "requested") {
       if (currentTarget === placeholder.expectedOldText && currentHash === response.baseHash) {
@@ -771,6 +776,11 @@ export default class AiReviewPlugin extends Plugin {
     await this.persistence.deleteFile(responseFile);
     if (placeholder.status === "pending" || placeholder.status === "conflict") {
       this.revealSuggestionInline(placeholder);
+    }
+    if (!citationMarkersPreserved) {
+      new Notice(
+        `Suggestion ${placeholder.id} changed citation markers. Review footnotes before accepting.`
+      );
     }
     return true;
   }
@@ -1695,6 +1705,19 @@ function normalizeAiOutput(value: string): string {
   return trimmed;
 }
 
+function extractCitationMarkers(text: string): string[] {
+  return [...text.matchAll(/\[\^[^\]\r\n]+\]/g)].map((match) => match[0]);
+}
+
+function haveSameCitationMarkers(left: string, right: string): boolean {
+  const leftMarkers = extractCitationMarkers(left);
+  const rightMarkers = extractCitationMarkers(right);
+  if (leftMarkers.length !== rightMarkers.length) {
+    return false;
+  }
+  return leftMarkers.every((marker, index) => marker === rightMarkers[index]);
+}
+
 function buildCodexResponseTemplate(request: CodexSelectionRequest): CodexSelectionResponse {
   return {
     schemaVersion: 1,
@@ -1910,6 +1933,8 @@ function buildCodexWatcherScript(): string {
     "- Return exactly one JSON object matching the response schema.",
     "- Return raw JSON only. No markdown fences. No commentary.",
     "- Preserve citation markers, equations, units, markdown, and claim scope unless the request itself implies a change.",
+    "- Preserve every citation and footnote marker exactly as written, including order and placement (for example [^1], [^2]).",
+    "- Do not add, remove, renumber, or relocate citation markers unless the selected text already does so.",
     "- Fill suggestion.rationale with one short sentence.",
     "",
     "REQUEST JSON",
