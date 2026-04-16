@@ -54,7 +54,7 @@ export class ReviewPersistence {
     }
 
     const raw = await adapter.read(reviewPath);
-    return JSON.parse(raw) as ReviewState;
+    return JSON.parse(stripJsonBom(raw)) as ReviewState;
   }
 
   async writeReviewState(state: ReviewState): Promise<string> {
@@ -118,7 +118,7 @@ export class ReviewPersistence {
 
   async readSelectionResponse(path: string): Promise<CodexSelectionResponse> {
     const raw = await this.app.vault.adapter.read(path);
-    return JSON.parse(raw) as CodexSelectionResponse;
+    return JSON.parse(stripJsonBom(raw)) as CodexSelectionResponse;
   }
 
   async deleteFile(path: string): Promise<void> {
@@ -169,4 +169,8 @@ export class ReviewPersistence {
       await adapter.mkdir(current);
     }
   }
+}
+
+function stripJsonBom(text: string): string {
+  return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
 }

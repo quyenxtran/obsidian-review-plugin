@@ -69,8 +69,6 @@ export default class AiReviewPlugin extends Plugin {
   selectedSuggestionId: string | null = null;
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
-  private lastSurfacedSuggestionId: string | null = null;
-
   override async onload(): Promise<void> {
     await this.loadSettings();
     this.persistence = new ReviewPersistence(this.app, () => this.settings);
@@ -356,14 +354,18 @@ export default class AiReviewPlugin extends Plugin {
     this.selectedSuggestionId =
       this.currentReviewState?.suggestions.find((item) => item.status === "pending")?.id ?? null;
     this.refreshActiveEditorDecorations();
-    this.maybeSurfacePendingSuggestion();
+    this.maybeRevealPendingSuggestion();
   }
 
   private async ensureReviewStateForNote(
     notePath: string,
     currentHash: string
   ): Promise<ReviewState> {
-    if (this.currentReviewState && this.activeNotePath === notePath) {
+    if (
+      this.currentReviewState &&
+      this.activeNotePath === notePath &&
+      normalizePath(this.currentReviewState.notePath) === notePath
+    ) {
       this.currentReviewState.currentHash = currentHash;
       return this.currentReviewState;
     }
@@ -604,25 +606,17 @@ export default class AiReviewPlugin extends Plugin {
       return;
     }
 
-    await this.openSuggestionReviewModal(suggestion.id);
+    this.revealSuggestionInline(suggestion);
   }
 
-  private maybeSurfacePendingSuggestion(): void {
+  private maybeRevealPendingSuggestion(): void {
     const suggestion = this.getLatestActionableSuggestion();
 
     if (!suggestion) {
-      this.lastSurfacedSuggestionId = null;
       return;
     }
 
-    if (this.lastSurfacedSuggestionId === suggestion.id) {
-      return;
-    }
-
-    this.lastSurfacedSuggestionId = suggestion.id;
-    window.setTimeout(() => {
-      void this.openSuggestionReviewModal(suggestion.id);
-    }, 100);
+    this.revealSuggestionInline(suggestion);
   }
 
   private async openSuggestionReviewModal(id: string): Promise<void> {
@@ -666,6 +660,12 @@ export default class AiReviewPlugin extends Plugin {
         () => resolve()
       ).open();
     });
+  }
+
+  private revealSuggestionInline(suggestion: Suggestion): void {
+    this.selectedSuggestionId = suggestion.id;
+    this.jumpToSuggestion(suggestion);
+    this.refreshActiveEditorDecorations();
   }
 
   private async importCodexResponsesForActiveFile(): Promise<void> {
@@ -769,10 +769,8 @@ export default class AiReviewPlugin extends Plugin {
       payloadGenerator: response.generator.model || response.generator.source
     });
     await this.persistence.deleteFile(responseFile);
-    this.jumpToSuggestion(placeholder);
     if (placeholder.status === "pending" || placeholder.status === "conflict") {
-      this.lastSurfacedSuggestionId = placeholder.id;
-      void this.openSuggestionReviewModal(placeholder.id);
+      this.revealSuggestionInline(placeholder);
     }
     return true;
   }
@@ -923,11 +921,12 @@ export default class AiReviewPlugin extends Plugin {
       const escapedFolderPath = folderPath.replace(/'/g, "''");
       const script = [
         `$folder = '${escapedFolderPath}'`,
+        "$pattern = [regex]::Escape('-NoteFolder ' + $folder)",
         "Get-CimInstance Win32_Process |",
         "Where-Object {",
         "  $_.Name -match 'powershell' -and",
         "  $_.CommandLine -match 'watch-review-inbox\\.ps1' -and",
-        "  $_.CommandLine -like ('*' + $folder + '*')",
+        "  $_.CommandLine -match $pattern",
         "} |",
         "Select-Object -First 1 -ExpandProperty ProcessId"
       ].join(" ");
@@ -1819,6 +1818,10 @@ function buildCodexWatcherScript(): string {
     ")",
     "",
     "$ErrorActionPreference = 'Continue'",
+    "$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)",
+    "$OutputEncoding = $Utf8NoBom",
+    "[Console]::InputEncoding = $Utf8NoBom",
+    "[Console]::OutputEncoding = $Utf8NoBom",
     "",
     "function Log([string]$Message) {",
     "  Write-Host \"[AI Review Watcher] $Message\"",
@@ -1848,6 +1851,14 @@ function buildCodexWatcherScript(): string {
     "  return $trimmed.Trim()",
     "}",
     "",
+    "function Read-Utf8Text([string]$PathValue) {",
+    "  return [System.IO.File]::ReadAllText($PathValue, $Utf8NoBom)",
+    "}",
+    "",
+    "function Write-Utf8Text([string]$PathValue, [string]$Content) {",
+    "  [System.IO.File]::WriteAllText($PathValue, $Content, $Utf8NoBom)",
+    "}",
+    "",
     "function Invoke-Request([string]$RequestPath) {",
     "  $requestId = Get-RequestIdFromPath $RequestPath",
     "  $lockPath = Join-Path $RequestsFolder \"$requestId.processing.lock\"",
@@ -1855,6 +1866,7 @@ function buildCodexWatcherScript(): string {
     "  $responsePath = Join-Path $ResponsesFolder \"$requestId.response.json\"",
     "  $templatePath = Join-Path $ResponsesFolder \"$requestId.response.template.json\"",
     "  $guidePath = Join-Path $RequestsFolder \"$requestId.launch.md\"",
+    "  $promptPath = Join-Path $ResponsesFolder \"$requestId.prompt.txt\"",
     "  $tempOutputPath = Join-Path $ResponsesFolder \"$requestId.codex-output.json\"",
     "  $runLogPath = Join-Path $ResponsesFolder \"$requestId.codex.log\"",
     "  $errorPath = Join-Path $ResponsesFolder \"$requestId.error.log\"",
@@ -1864,7 +1876,7 @@ function buildCodexWatcherScript(): string {
     "  }",
     "",
     "  try {",
-    "    $requestRaw = Get-Content -LiteralPath $RequestPath -Raw",
+    "    $requestRaw = Read-Utf8Text $RequestPath",
     "    $request = $requestRaw | ConvertFrom-Json",
     "  } catch {",
     "    Log \"Skipping unreadable request: $RequestPath\"",
@@ -1872,8 +1884,9 @@ function buildCodexWatcherScript(): string {
     "  }",
     "",
     "  $notePath = Join-Path $VaultBasePath $request.notePath",
-    "  $requestNoteFolder = Split-Path -Parent $notePath",
-    "  if ((Normalize $requestNoteFolder) -ne (Normalize $NoteFolder)) {",
+    "  $requestNoteFolder = Normalize (Split-Path -Parent $notePath)",
+    "  $normalizedNoteFolder = Normalize $NoteFolder",
+    "  if (($requestNoteFolder -ne $normalizedNoteFolder) -and -not $requestNoteFolder.StartsWith($normalizedNoteFolder + [System.IO.Path]::DirectorySeparatorChar)) {",
     "    return",
     "  }",
     "",
@@ -1883,9 +1896,9 @@ function buildCodexWatcherScript(): string {
     "    if (-not (Test-Path $notePath)) {",
     "      throw \"Note file not found: $notePath\"",
     "    }",
-    "    $noteRaw = Get-Content -LiteralPath $notePath -Raw",
-    "    $templateRaw = if (Test-Path $templatePath) { Get-Content -LiteralPath $templatePath -Raw } else { '' }",
-    "    $guideRaw = if (Test-Path $guidePath) { Get-Content -LiteralPath $guidePath -Raw } else { '' }",
+    "    $noteRaw = Read-Utf8Text $notePath",
+    "    $templateRaw = if (Test-Path $templatePath) { Read-Utf8Text $templatePath } else { '' }",
+    "    $guideRaw = if (Test-Path $guidePath) { Read-Utf8Text $guidePath } else { '' }",
     "    $prompt = @\"",
     "Generate one Obsidian AI Review response.",
     "",
@@ -1912,7 +1925,8 @@ function buildCodexWatcherScript(): string {
     "$guideRaw",
     "\"@",
     "",
-    "    & $CodexCommand exec -C $NoteFolder --skip-git-repo-check --disable plugins --ephemeral --color never --output-schema $ResponseSchemaPath -o $tempOutputPath $prompt *> $runLogPath",
+    "    Write-Utf8Text $promptPath $prompt",
+    "    [System.IO.File]::ReadAllText($promptPath, $Utf8NoBom) | & $CodexCommand exec -C $NoteFolder --skip-git-repo-check --disable plugins --ephemeral --color never --output-schema $ResponseSchemaPath -o $tempOutputPath *>&1 | Out-File -LiteralPath $runLogPath -Encoding utf8",
     "    $codexExitCode = $LASTEXITCODE",
     "    if ($codexExitCode -ne 0 -and -not (Test-Path $tempOutputPath)) {",
     "      throw \"Codex exited with code $codexExitCode. See $runLogPath\"",
@@ -1922,7 +1936,7 @@ function buildCodexWatcherScript(): string {
     "      throw \"Codex did not write an output file.\"",
     "    }",
     "",
-    "    $rawOutput = Get-Content -LiteralPath $tempOutputPath -Raw",
+    "    $rawOutput = Read-Utf8Text $tempOutputPath",
     "    $jsonText = Clean-JsonText $rawOutput",
     "    $parsed = $jsonText | ConvertFrom-Json",
     "",
@@ -1936,16 +1950,19 @@ function buildCodexWatcherScript(): string {
     "      $parsed.generator.model = 'codex'",
     "    }",
     "",
-    "    $parsed | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $responsePath -Encoding UTF8",
+    "    Write-Utf8Text $responsePath ($parsed | ConvertTo-Json -Depth 10)",
     "    New-Item -ItemType File -Path $donePath -Force | Out-Null",
     "    if (Test-Path $errorPath) {",
     "      Remove-Item -LiteralPath $errorPath -Force",
     "    }",
     "    Log \"Wrote response for $requestId\"",
     "  } catch {",
-    "    (($_ | Out-String) + \"`n`nRun log: $runLogPath\") | Set-Content -LiteralPath $errorPath -Encoding UTF8",
+    "    Write-Utf8Text $errorPath (($_ | Out-String) + \"`n`nRun log: $runLogPath\")",
     "    Log \"Failed $requestId. See $errorPath\"",
     "  } finally {",
+    "    if (Test-Path $promptPath) {",
+    "      Remove-Item -LiteralPath $promptPath -Force",
+    "    }",
     "    if (Test-Path $tempOutputPath) {",
     "      Remove-Item -LiteralPath $tempOutputPath -Force",
     "    }",
@@ -1963,7 +1980,7 @@ function buildCodexWatcherScript(): string {
     "      continue",
     "    }",
     "    Get-ChildItem -LiteralPath $RequestsFolder -Filter *.request.json -File -ErrorAction SilentlyContinue |",
-    "      Sort-Object LastWriteTime, Name |",
+    "      Sort-Object LastWriteTime, Name -Descending |",
     "      ForEach-Object {",
     "        Invoke-Request $_.FullName",
     "      }",
