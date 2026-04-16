@@ -2,6 +2,11 @@ import { MarkdownView, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { sha256 } from "./hash";
 import { ReviewPersistence } from "./persistence";
 import {
+  createReviewDecorationsExtension,
+  type SuggestionAction,
+  refreshReviewEffect
+} from "./reviewDecorations";
+import {
   DEFAULT_SETTINGS,
   type AiReviewSettings,
   type ReviewPayload,
@@ -12,10 +17,13 @@ import {
 export default class AiReviewPlugin extends Plugin {
   settings: AiReviewSettings = DEFAULT_SETTINGS;
   persistence!: ReviewPersistence;
+  currentReviewState: ReviewState | null = null;
+  activeNotePath: string | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
     this.persistence = new ReviewPersistence(this.app, () => this.settings);
+    this.registerEditorExtension(createReviewDecorationsExtension(this));
 
     this.addCommand({
       id: "ai-review-status",
@@ -32,6 +40,18 @@ export default class AiReviewPlugin extends Plugin {
         await this.importSuggestionsFromJson();
       }
     });
+
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", async () => {
+        await this.loadStateForActiveFile();
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("file-open", async () => {
+        await this.loadStateForActiveFile();
+      })
+    );
+    await this.loadStateForActiveFile();
   }
 
   private async loadSettings(): Promise<void> {
@@ -87,6 +107,8 @@ export default class AiReviewPlugin extends Plugin {
     };
 
     const reviewFile = await this.persistence.writeReviewState(state);
+    this.currentReviewState = state;
+    this.activeNotePath = activePath;
     await this.persistence.appendAuditEvent({
       eventType: "import",
       notePath: activePath,
@@ -110,10 +132,12 @@ export default class AiReviewPlugin extends Plugin {
         payloadGenerator: payload.generator.source
       });
       new Notice(`Imported ${suggestions.length} suggestions, but marked stale (hash mismatch).`);
+      this.refreshActiveEditorDecorations();
       return;
     }
 
     new Notice(`Imported ${suggestions.length} suggestions.`);
+    this.refreshActiveEditorDecorations();
   }
 
   private getActiveMarkdownFile(): TFile | null {
@@ -229,6 +253,49 @@ export default class AiReviewPlugin extends Plugin {
         resolve(input.files?.item(0) ?? null);
       };
       input.click();
+    });
+  }
+
+  async loadStateForActiveFile(): Promise<void> {
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      this.currentReviewState = null;
+      this.activeNotePath = null;
+      return;
+    }
+
+    const notePath = normalizePath(file.path);
+    this.activeNotePath = notePath;
+    this.currentReviewState = await this.persistence.readReviewState(notePath);
+    this.refreshActiveEditorDecorations();
+  }
+
+  getRenderableSuggestions(): Suggestion[] {
+    if (!this.currentReviewState) {
+      return [];
+    }
+    return this.currentReviewState.suggestions.filter((suggestion) => {
+      return (
+        suggestion.status === "pending" ||
+        suggestion.status === "stale" ||
+        suggestion.status === "conflict"
+      );
+    });
+  }
+
+  async onSuggestionAction(id: string, action: SuggestionAction): Promise<void> {
+    const text = action === "accept" ? "Accept" : "Reject";
+    new Notice(`${text} clicked for ${id}. Apply engine is next.`);
+  }
+
+  private refreshActiveEditorDecorations(): void {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const cm = (view?.editor as unknown as { cm?: { dispatch: (spec: unknown) => void } }).cm;
+    if (!cm) {
+      return;
+    }
+    cm.dispatch({
+      effects: [refreshReviewEffect.of(undefined)]
     });
   }
 }
