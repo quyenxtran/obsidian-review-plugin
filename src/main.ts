@@ -1,6 +1,7 @@
 import { MarkdownView, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
 import { MapMode, type ChangeDesc } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
+import * as nodePath from "path";
 import { sha256 } from "./hash";
 import { ReviewPersistence } from "./persistence";
 import {
@@ -27,6 +28,7 @@ export default class AiReviewPlugin extends Plugin {
   selectedSuggestionId: string | null = null;
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
+  private readonly launchedCodexFolders = new Set<string>();
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -423,6 +425,7 @@ export default class AiReviewPlugin extends Plugin {
     this.activeNotePath = notePath;
     this.selectedSuggestionId = suggestion.id;
     const requestFile = await this.persistence.writeSelectionRequest(request);
+    const responseFile = this.persistence.getResponseFilePath(requestId);
     const reviewFile = await this.persistence.writeReviewState(state);
     await this.persistence.appendAuditEvent({
       eventType: "request",
@@ -437,6 +440,7 @@ export default class AiReviewPlugin extends Plugin {
     });
     this.refreshActiveEditorDecorations();
     const suffix = replacedCount > 0 ? ` Replaced ${replacedCount} overlapping suggestion(s).` : "";
+    await this.maybeLaunchCodexForFile(view.file, requestFile, responseFile);
     new Notice(`Created Codex request.${suffix} Response expected in ${this.settings.responsesFolder}.`);
     console.info("AI Review request file:", requestFile);
   }
@@ -823,6 +827,106 @@ export default class AiReviewPlugin extends Plugin {
     }
 
     return overlapping.length;
+  }
+
+  private async maybeLaunchCodexForFile(
+    file: TFile,
+    requestPath: string,
+    responsePath: string
+  ): Promise<void> {
+    if (!this.settings.autoLaunchCodex) {
+      return;
+    }
+    if (typeof window.require !== "function") {
+      return;
+    }
+    if (process.platform !== "win32") {
+      return;
+    }
+
+    const noteFolder = this.getAbsoluteNoteFolder(file);
+    if (!noteFolder) {
+      return;
+    }
+    const normalizedFolder = nodePath.normalize(noteFolder);
+    if (this.launchedCodexFolders.has(normalizedFolder)) {
+      return;
+    }
+
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) {
+      return;
+    }
+
+    const absoluteRequestPath = nodePath.join(vaultBase, requestPath);
+    const absoluteResponsePath = nodePath.join(vaultBase, responsePath);
+    const codexPrompt = [
+      "An Obsidian AI Review request is waiting.",
+      `Request JSON: ${absoluteRequestPath}`,
+      `Write response JSON to: ${absoluteResponsePath}`,
+      "Stay in this folder, help the user interactively, and produce exactly the response schema the plugin expects."
+    ].join(" ");
+
+    try {
+      const childProcess = window.require("child_process") as {
+        spawn: (
+          command: string,
+          args: string[],
+          options?: { detached?: boolean; stdio?: string; windowsHide?: boolean }
+        ) => { unref?: () => void };
+      };
+      const child = childProcess.spawn(
+        "cmd.exe",
+        [
+          "/c",
+          "start",
+          "",
+          "/D",
+          normalizedFolder,
+          "powershell.exe",
+          "-NoExit",
+          "-Command",
+          this.settings.codexCliCommand.trim() || "codex",
+          "-C",
+          normalizedFolder,
+          codexPrompt
+        ],
+        {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true
+        }
+      );
+      child.unref?.();
+      this.launchedCodexFolders.add(normalizedFolder);
+    } catch (error) {
+      console.error("AI Review could not launch Codex terminal.", error);
+      new Notice("AI Review could not auto-launch Codex. Check the Codex CLI command in settings.");
+    }
+  }
+
+  private getVaultBasePath(): string | null {
+    const adapter = this.app.vault.adapter as { getBasePath?: () => string; basePath?: string };
+    if (typeof adapter.getBasePath === "function") {
+      return adapter.getBasePath();
+    }
+    if (typeof adapter.basePath === "string" && adapter.basePath.trim()) {
+      return adapter.basePath;
+    }
+    return null;
+  }
+
+  private getAbsoluteNoteFolder(file: TFile): string | null {
+    const vaultBase = this.getVaultBasePath();
+    if (!vaultBase) {
+      return null;
+    }
+
+    const relativeDir = nodePath.dirname(file.path);
+    if (!relativeDir || relativeDir === ".") {
+      return vaultBase;
+    }
+    return nodePath.join(vaultBase, relativeDir);
   }
 
   private async markSuggestionRejected(suggestion: Suggestion): Promise<void> {

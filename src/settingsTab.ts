@@ -41,6 +41,31 @@ export class AiReviewSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Auto-launch Codex")
+      .setDesc("When enabled, opening a new request launches a Codex terminal in the note folder if this plugin has not launched one there yet.")
+      .addToggle((toggle) =>
+        toggle
+          .setValue(this.plugin.settings.autoLaunchCodex)
+          .onChange(async (value) => {
+            this.plugin.settings.autoLaunchCodex = value;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Codex CLI command")
+      .setDesc("Command used to start the terminal Codex session.")
+      .addText((text) =>
+        text
+          .setPlaceholder("codex")
+          .setValue(this.plugin.settings.codexCliCommand)
+          .onChange(async (value) => {
+            this.plugin.settings.codexCliCommand = value.trim() || "codex";
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
       .setName("Review sidecar folder")
       .setDesc("Vault-relative folder for review state JSON files.")
       .addText((text) =>

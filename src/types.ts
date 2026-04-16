@@ -109,6 +109,8 @@ export interface AiReviewSettings {
   auditLogPath: string;
   reviewerName: string;
   defaultEditInstruction: string;
+  autoLaunchCodex: boolean;
+  codexCliCommand: string;
 }
 
 export const DEFAULT_SETTINGS: AiReviewSettings = {
@@ -118,5 +120,7 @@ export const DEFAULT_SETTINGS: AiReviewSettings = {
   auditLogPath: ".obsidian/ai-review/review-log.ndjson",
   reviewerName: "",
   defaultEditInstruction:
-    "Revise the selected text for clarity, grammar, technical precision, and concision. Preserve meaning, markdown, citations, equations, and notation. Return only the revised replacement text with no commentary or quotation marks."
+    "Revise the selected text for clarity, grammar, technical precision, and concision. Preserve meaning, markdown, citations, equations, and notation. Return only the revised replacement text with no commentary or quotation marks.",
+  autoLaunchCodex: true,
+  codexCliCommand: "codex"
 };
