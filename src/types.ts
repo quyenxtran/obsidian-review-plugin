@@ -1,101 +1,101 @@
-export type ReviewStatus =
-  | "requested"
-  | "pending"
-  | "accepted"
-  | "rejected"
-  | "stale"
-  | "conflict";
+export type ReviewSchemaVersion = 1;
+export type ReviewTimestamp = string;
+export type Sha256Hash = string;
+export type ReviewGeneratorSource = "codex";
 
-export interface Suggestion {
-  id: string;
-  requestId?: string;
+export const REVIEW_STATUSES = [
+  "requested",
+  "pending",
+  "accepted",
+  "rejected",
+  "stale",
+  "conflict"
+] as const;
+export type ReviewStatus = (typeof REVIEW_STATUSES)[number];
+
+export const REVIEW_ACTION_TYPES = [
+  "request",
+  "generate",
+  "import",
+  "edit",
+  "resolve",
+  "accept",
+  "reject",
+  "accept_all",
+  "reject_all",
+  "mark_stale",
+  "conflict"
+] as const;
+export type ReviewActionType = (typeof REVIEW_ACTION_TYPES)[number];
+
+export interface ReviewIdentity {
+  notePath: string;
+  baseHash: Sha256Hash;
+}
+
+export interface ReviewRange {
   start: number;
   end: number;
+}
+
+export interface ReviewSelection extends ReviewRange {
+  text: string;
+}
+
+export interface Suggestion extends ReviewRange {
+  id: string;
+  requestId?: string;
   expectedOldText: string;
   newText: string;
   rationale?: string;
   status: ReviewStatus;
-  createdAt: string;
-  decidedAt?: string;
+  createdAt: ReviewTimestamp;
+  decidedAt?: ReviewTimestamp;
   decidedBy?: string;
 }
 
 export interface ReviewGeneratorInfo {
-  source: "codex";
+  source: ReviewGeneratorSource;
   model?: string;
-  generatedAt: string;
+  generatedAt: ReviewTimestamp;
 }
 
-export interface CodexSelectionRequest {
-  schemaVersion: 1;
+export interface CodexSelectionRequest extends ReviewIdentity {
+  schemaVersion: ReviewSchemaVersion;
   requestId: string;
-  notePath: string;
-  baseHash: string;
-  createdAt: string;
+  createdAt: ReviewTimestamp;
   instruction: string;
   contextBefore?: string;
   contextAfter?: string;
-  selection: {
-    start: number;
-    end: number;
-    text: string;
-  };
+  selection: ReviewSelection;
 }
 
-export interface CodexSelectionResponse {
-  schemaVersion: 1;
+export interface CodexSelectionResponse extends ReviewIdentity {
+  schemaVersion: ReviewSchemaVersion;
   requestId: string;
-  notePath: string;
-  baseHash: string;
   generator: ReviewGeneratorInfo;
-  suggestion: {
-    newText: string;
-    rationale?: string;
-  };
+  suggestion: Pick<Suggestion, "newText" | "rationale">;
 }
 
-export interface ReviewPayload {
-  schemaVersion: 1;
-  notePath: string;
-  baseHash: string;
-  generator: ReviewGeneratorInfo;
+export interface ReviewState extends ReviewIdentity {
+  schemaVersion: ReviewSchemaVersion;
+  currentHash: Sha256Hash;
   suggestions: Suggestion[];
+  importedAt: ReviewTimestamp;
+  updatedAt: ReviewTimestamp;
 }
-
-export interface ReviewState {
-  schemaVersion: 1;
-  notePath: string;
-  baseHash: string;
-  currentHash: string;
-  suggestions: Suggestion[];
-  importedAt: string;
-  updatedAt: string;
-}
-
-export type ReviewActionType =
-  | "request"
-  | "generate"
-  | "import"
-  | "edit"
-  | "resolve"
-  | "accept"
-  | "reject"
-  | "accept_all"
-  | "reject_all"
-  | "mark_stale"
-  | "conflict";
 
 export interface AuditEvent {
   eventType: ReviewActionType;
   notePath: string;
   reviewFile: string;
-  timestamp: string;
+  timestamp: ReviewTimestamp;
   reviewer?: string;
   suggestionId?: string;
   fromStatus?: ReviewStatus;
   toStatus?: ReviewStatus;
-  baseHash?: string;
-  currentHash?: string;
+  baseHash?: Sha256Hash;
+  currentHash?: Sha256Hash;
   payloadGenerator?: string;
   appliedCount?: number;
   conflictedCount?: number;
@@ -111,6 +111,11 @@ export interface AiReviewSettings {
   defaultEditInstruction: string;
   autoLaunchCodex: boolean;
   codexCliCommand: string;
+}
+
+export interface AiReviewSettingsHost {
+  settings: AiReviewSettings;
+  saveSettings(): Promise<void>;
 }
 
 export const DEFAULT_SETTINGS: AiReviewSettings = {

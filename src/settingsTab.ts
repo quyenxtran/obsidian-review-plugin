@@ -1,8 +1,8 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
-import type AiReviewPlugin from "./main";
+import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
+import type { AiReviewSettingsHost } from "./types";
 
 export class AiReviewSettingTab extends PluginSettingTab {
-  constructor(app: App, private readonly plugin: AiReviewPlugin) {
+  constructor(app: App, private readonly plugin: Plugin & AiReviewSettingsHost) {
     super(app, plugin);
   }
 
@@ -42,7 +42,7 @@ export class AiReviewSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Auto-launch Codex")
-      .setDesc("When enabled, the plugin starts one long-lived Codex watcher terminal per note folder and lets it process queued requests.")
+      .setDesc("Start one Codex watcher terminal per note folder to process queued review requests.")
       .addToggle((toggle) =>
         toggle
           .setValue(this.plugin.settings.autoLaunchCodex)

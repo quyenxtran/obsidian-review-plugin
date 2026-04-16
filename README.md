@@ -11,13 +11,11 @@ DOCX-style review workflow for AI edits in markdown notes:
 - Desktop Obsidian only
 - Single active note review at a time
 - Terminal-Codex workflow via request/response files
-- Legacy JSON import still available for backfill and debugging
 
 ## Commands
 - `AI Review: Show status`
 - `AI Review: Request Codex suggestion for selection`
 - `AI Review: Check for Codex responses`
-- `AI Review: Import suggestions from JSON (legacy)`
 - `AI Review: Next suggestion`
 - `AI Review: Previous suggestion`
 - `AI Review: Accept current suggestion`
@@ -48,7 +46,7 @@ Both paths are configurable in plugin settings.
 ## Terminal Codex Flow
 1. In Obsidian, select text in a note.
 2. Run `AI Review: Request Codex suggestion for selection`.
-3. If auto-launch is enabled, the plugin starts one long-lived Codex watcher terminal in the same folder as the active markdown file.
+3. If auto-launch is enabled, the plugin starts one Codex watcher terminal in the same folder as the active markdown file.
 4. The plugin writes a request JSON file into `.obsidian/ai-review/requests/`.
 5. The plugin also writes a launch guide and a response template for each request.
 6. The watcher terminal polls the request queue, runs `codex exec` for each request, reads the full note for context, and writes a matching response JSON into `.obsidian/ai-review/responses/`.
@@ -56,9 +54,9 @@ Both paths are configurable in plugin settings.
 8. Accept, reject, or edit the inline suggestion in Obsidian.
 
 ## Auto-launch Notes
-- Current implementation is Windows-first.
-- The current implementation keeps one watcher terminal per note folder per Obsidian session.
-- The watcher processes queued requests sequentially and uses `codex exec` for each request.
+- Windows-first.
+- One watcher terminal per note folder.
+- Requests are processed sequentially with `codex exec`.
 - You can disable this behavior in plugin settings.
 
 ## Request Schema (v1)
@@ -101,32 +99,6 @@ Both paths are configurable in plugin settings.
 }
 ```
 
-## JSON Import Schema (v1)
-
-```json
-{
-  "schemaVersion": 1,
-  "notePath": "Drafts/My Note.md",
-  "baseHash": "sha256-of-note-text-at-generation-time",
-  "generator": {
-    "source": "codex",
-    "model": "gpt-5.4",
-    "generatedAt": "2026-04-16T12:00:00.000Z"
-  },
-  "suggestions": [
-    {
-      "id": "s-1",
-      "start": 120,
-      "end": 152,
-      "expectedOldText": "old phrase here",
-      "newText": "new phrase here",
-      "rationale": "tighten wording",
-      "createdAt": "2026-04-16T12:00:00.000Z"
-    }
-  ]
-}
-```
-
 ## How Accept/Reject Works
 - `Reject` changes only the suggestion status.
 - `Accept` applies edits to the note text.
@@ -151,10 +123,6 @@ Generated output: `main.js` in repo root.
   - make sure terminal Codex wrote a valid response JSON into the configured responses folder.
 - Response imported as `conflict`:
   - the selected span changed before the response arrived; use `Resolve` or regenerate from the latest text.
-- "Payload is for X, active note is Y":
-  - open the matching note and re-run import.
-- "Marked stale (hash mismatch)":
-  - note text changed since suggestions were generated; regenerate suggestions from latest note text.
 - "Conflict for s-N":
   - expected anchor text no longer matches; regenerate that suggestion against current content.
 

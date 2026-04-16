@@ -15,40 +15,35 @@ export class ReviewPersistence {
   ) {}
 
   getReviewFilePath(notePath: string): string {
-    const settings = this.getSettings();
     const noteHash = sha256(normalizePath(notePath));
-    const fileName = `${noteHash}.review.json`;
-    return normalizePath(`${settings.reviewsFolder}/${fileName}`);
+    return this.getArtifactPath(this.getSettings().reviewsFolder, `${noteHash}.review.json`);
   }
 
   getRequestFilePath(requestId: string): string {
-    const settings = this.getSettings();
-    return normalizePath(`${settings.requestsFolder}/${requestId}.request.json`);
+    return this.getArtifactPath(this.getSettings().requestsFolder, `${requestId}.request.json`);
   }
 
   getResponseFilePath(requestId: string): string {
-    const settings = this.getSettings();
-    return normalizePath(`${settings.responsesFolder}/${requestId}.response.json`);
+    return this.getArtifactPath(this.getSettings().responsesFolder, `${requestId}.response.json`);
   }
 
   getResponseTemplateFilePath(requestId: string): string {
-    const settings = this.getSettings();
-    return normalizePath(`${settings.responsesFolder}/${requestId}.response.template.json`);
+    return this.getArtifactPath(
+      this.getSettings().responsesFolder,
+      `${requestId}.response.template.json`
+    );
   }
 
   getLaunchGuideFilePath(requestId: string): string {
-    const settings = this.getSettings();
-    return normalizePath(`${settings.requestsFolder}/${requestId}.launch.md`);
+    return this.getArtifactPath(this.getSettings().requestsFolder, `${requestId}.launch.md`);
   }
 
   getWatcherScriptPath(): string {
-    const settings = this.getSettings();
-    return normalizePath(`${settings.reviewsFolder}/watch-review-inbox.ps1`);
+    return this.getArtifactPath(this.getSettings().reviewsFolder, "watch-review-inbox.ps1");
   }
 
   getResponseSchemaPath(): string {
-    const settings = this.getSettings();
-    return normalizePath(`${settings.reviewsFolder}/codex-response-schema.json`);
+    return this.getArtifactPath(this.getSettings().reviewsFolder, "codex-response-schema.json");
   }
 
   async readReviewState(notePath: string): Promise<ReviewState | null> {
@@ -64,9 +59,7 @@ export class ReviewPersistence {
 
   async writeReviewState(state: ReviewState): Promise<string> {
     const reviewPath = this.getReviewFilePath(state.notePath);
-    await this.ensureParentFolder(reviewPath);
-    await this.app.vault.adapter.write(reviewPath, JSON.stringify(state, null, 2));
-    return reviewPath;
+    return this.writeJsonFile(reviewPath, state);
   }
 
   async appendAuditEvent(event: AuditEvent): Promise<void> {
@@ -95,38 +88,23 @@ export class ReviewPersistence {
   }
 
   async writeSelectionRequest(request: CodexSelectionRequest): Promise<string> {
-    const path = this.getRequestFilePath(request.requestId);
-    await this.ensureParentFolder(path);
-    await this.app.vault.adapter.write(path, JSON.stringify(request, null, 2));
-    return path;
+    return this.writeJsonFile(this.getRequestFilePath(request.requestId), request);
   }
 
   async writeResponseTemplate(requestId: string, template: unknown): Promise<string> {
-    const path = this.getResponseTemplateFilePath(requestId);
-    await this.ensureParentFolder(path);
-    await this.app.vault.adapter.write(path, JSON.stringify(template, null, 2));
-    return path;
+    return this.writeJsonFile(this.getResponseTemplateFilePath(requestId), template);
   }
 
   async writeLaunchGuide(requestId: string, content: string): Promise<string> {
-    const path = this.getLaunchGuideFilePath(requestId);
-    await this.ensureParentFolder(path);
-    await this.app.vault.adapter.write(path, content);
-    return path;
+    return this.writeTextFile(this.getLaunchGuideFilePath(requestId), content);
   }
 
   async writeWatcherScript(content: string): Promise<string> {
-    const path = this.getWatcherScriptPath();
-    await this.ensureParentFolder(path);
-    await this.app.vault.adapter.write(path, content);
-    return path;
+    return this.writeTextFile(this.getWatcherScriptPath(), content);
   }
 
   async writeResponseSchema(content: string): Promise<string> {
-    const path = this.getResponseSchemaPath();
-    await this.ensureParentFolder(path);
-    await this.app.vault.adapter.write(path, content);
-    return path;
+    return this.writeTextFile(this.getResponseSchemaPath(), content);
   }
 
   async listSelectionResponses(): Promise<string[]> {
@@ -148,6 +126,22 @@ export class ReviewPersistence {
     if (await adapter.exists(path)) {
       await adapter.remove(path);
     }
+  }
+
+  private getArtifactPath(folderPath: string, fileName: string): string {
+    return normalizePath(`${normalizePath(folderPath)}/${fileName}`);
+  }
+
+  private async writeJsonFile(path: string, value: unknown): Promise<string> {
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, JSON.stringify(value, null, 2));
+    return path;
+  }
+
+  private async writeTextFile(path: string, content: string): Promise<string> {
+    await this.ensureParentFolder(path);
+    await this.app.vault.adapter.write(path, content);
+    return path;
   }
 
   private async ensureParentFolder(path: string): Promise<void> {

@@ -62,20 +62,6 @@
   background-color: color-mix(in srgb, var(--color-orange) 22%, transparent);
 }
 
-.ai-review-edit-modal textarea.ai-review-edit-textarea {
-  width: 100%;
-  min-height: 14rem;
-  margin-top: 0.75rem;
-  resize: vertical;
-}
-
-.ai-review-edit-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.5rem;
-  margin-top: 0.75rem;
-}
-
 .ai-review-review-status,
 .ai-review-review-rationale {
   color: var(--text-muted);
@@ -93,12 +79,22 @@
   word-break: break-word;
 }
 
+.ai-review-edit-modal textarea.ai-review-edit-textarea,
 .ai-review-review-textarea {
   width: 100%;
-  min-height: 16rem;
   resize: vertical;
 }
 
+.ai-review-edit-modal textarea.ai-review-edit-textarea {
+  min-height: 14rem;
+  margin-top: 0.75rem;
+}
+
+.ai-review-review-textarea {
+  min-height: 16rem;
+}
+
+.ai-review-edit-actions,
 .ai-review-review-actions {
   display: flex;
   justify-content: flex-end;

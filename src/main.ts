@@ -1,4 +1,14 @@
-import { Editor, MarkdownView, Menu, Modal, Notice, Plugin, TFile, normalizePath } from "obsidian";
+import {
+  Editor,
+  MarkdownView,
+  Menu,
+  Modal,
+  Notice,
+  Plugin,
+  TFile,
+  normalizePath,
+  type EventRef
+} from "obsidian";
 import { MapMode, type ChangeDesc } from "@codemirror/state";
 import type { ViewUpdate } from "@codemirror/view";
 import * as nodePath from "path";
@@ -15,10 +25,41 @@ import {
   type AiReviewSettings,
   type CodexSelectionRequest,
   type CodexSelectionResponse,
-  type ReviewPayload,
   type ReviewState,
   type Suggestion
 } from "./types";
+
+type CodeMirrorDispatchSpec = Parameters<import("@codemirror/view").EditorView["dispatch"]>[0];
+
+interface DispatchableCodeMirrorView {
+  dispatch(spec: CodeMirrorDispatchSpec): void;
+}
+
+interface NodeChildProcessModule {
+  spawn: (
+    command: string,
+    args: string[],
+    options?: { detached?: boolean; stdio?: string; windowsHide?: boolean }
+  ) => { unref?: () => void; pid?: number };
+  execFileSync: (
+    command: string,
+    args: string[],
+    options?: { encoding?: BufferEncoding; windowsHide?: boolean }
+  ) => string;
+}
+
+interface NodeFsModule {
+  existsSync(path: string): boolean;
+}
+
+declare module "obsidian" {
+  interface Workspace {
+    on(
+      name: "editor-menu",
+      callback: (menu: Menu, editor: Editor, view: MarkdownView) => void
+    ): EventRef;
+  }
+}
 
 export default class AiReviewPlugin extends Plugin {
   settings: AiReviewSettings = DEFAULT_SETTINGS;
@@ -28,7 +69,6 @@ export default class AiReviewPlugin extends Plugin {
   selectedSuggestionId: string | null = null;
   private suppressNextDocumentRebase = false;
   private persistReviewStateTimer: number | null = null;
-  private readonly launchedWatcherPids = new Map<string, number>();
   private lastSurfacedSuggestionId: string | null = null;
 
   override async onload(): Promise<void> {
@@ -58,14 +98,6 @@ export default class AiReviewPlugin extends Plugin {
       name: "AI Review: Check for Codex responses",
       callback: async () => {
         await this.importCodexResponsesForActiveFile();
-      }
-    });
-
-    this.addCommand({
-      id: "ai-review-import-json",
-      name: "AI Review: Import suggestions from JSON (legacy)",
-      callback: async () => {
-        await this.importSuggestionsFromJson();
       }
     });
 
@@ -136,12 +168,7 @@ export default class AiReviewPlugin extends Plugin {
     });
 
     this.registerEvent(
-      (this.app.workspace as unknown as {
-        on: (
-          name: string,
-          callback: (menu: Menu, editor: Editor, view: MarkdownView) => void
-        ) => unknown;
-      }).on("editor-menu", (menu: Menu, editor: Editor, view: MarkdownView) => {
+      this.app.workspace.on("editor-menu", (menu: Menu, editor: Editor, view: MarkdownView) => {
         const selectedText = editor.getSelection();
         if (!selectedText.trim()) {
           return;
@@ -155,7 +182,7 @@ export default class AiReviewPlugin extends Plugin {
               void this.createSelectionRequest(view, editor);
             });
         });
-      }) as never
+      })
     );
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", async () => {
@@ -176,90 +203,12 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private async loadSettings(): Promise<void> {
-    const loaded = (await this.loadData()) as Partial<AiReviewSettings> | null;
-    this.settings = { ...DEFAULT_SETTINGS, ...(loaded ?? {}) };
+    const loaded = await this.loadData();
+    this.settings = { ...DEFAULT_SETTINGS, ...parseSettingsData(loaded) };
   }
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
-  }
-
-  private async importSuggestionsFromJson(): Promise<void> {
-    const activeFile = this.getActiveMarkdownFile();
-    if (!activeFile) {
-      new Notice("Open a markdown note before importing suggestions.");
-      return;
-    }
-
-    const payload = await this.pickReviewPayload();
-    if (!payload) {
-      return;
-    }
-
-    const activePath = normalizePath(activeFile.path);
-    const payloadPath = normalizePath(payload.notePath);
-    if (activePath !== payloadPath) {
-      new Notice(`Payload is for "${payloadPath}", but active note is "${activePath}".`);
-      return;
-    }
-
-    const content = await this.app.vault.cachedRead(activeFile);
-    const currentHash = sha256(content);
-    const stale = currentHash !== payload.baseHash;
-    const now = new Date().toISOString();
-    const suggestions = payload.suggestions.map((suggestion) => {
-      return {
-        ...suggestion,
-        status: stale ? "stale" : "pending",
-        createdAt: suggestion.createdAt || now,
-        decidedAt: stale ? now : undefined,
-        decidedBy: stale ? this.settings.reviewerName || undefined : undefined
-      } satisfies Suggestion;
-    });
-
-    const state: ReviewState = {
-      schemaVersion: 1,
-      notePath: activePath,
-      baseHash: payload.baseHash,
-      currentHash,
-      suggestions,
-      importedAt: now,
-      updatedAt: now
-    };
-
-    const reviewFile = await this.persistence.writeReviewState(state);
-    this.currentReviewState = state;
-    this.activeNotePath = activePath;
-    this.selectedSuggestionId = this.currentReviewState.suggestions.find((item) => item.status === "pending")?.id ?? null;
-    await this.persistence.appendAuditEvent({
-      eventType: "import",
-      notePath: activePath,
-      reviewFile,
-      timestamp: now,
-      reviewer: this.settings.reviewerName || undefined,
-      baseHash: payload.baseHash,
-      currentHash,
-      payloadGenerator: payload.generator.source
-    });
-
-    if (stale) {
-      await this.persistence.appendAuditEvent({
-        eventType: "mark_stale",
-        notePath: activePath,
-        reviewFile,
-        timestamp: now,
-        reviewer: this.settings.reviewerName || undefined,
-        baseHash: payload.baseHash,
-        currentHash,
-        payloadGenerator: payload.generator.source
-      });
-      new Notice(`Imported ${suggestions.length} suggestions, but marked stale (hash mismatch).`);
-      this.refreshActiveEditorDecorations();
-      return;
-    }
-
-    new Notice(`Imported ${suggestions.length} suggestions.`);
-    this.refreshActiveEditorDecorations();
   }
 
   private getActiveMarkdownFile(): TFile | null {
@@ -268,114 +217,6 @@ export default class AiReviewPlugin extends Plugin {
       return null;
     }
     return view.file;
-  }
-
-  private async pickReviewPayload(): Promise<ReviewPayload | null> {
-    const file = await this.pickJsonFile();
-    if (!file) {
-      return null;
-    }
-    const text = await file.text();
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      new Notice("Could not parse JSON file.");
-      return null;
-    }
-
-    try {
-      return this.parseReviewPayload(parsed);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Invalid review payload.";
-      new Notice(message);
-      return null;
-    }
-  }
-
-  private parseReviewPayload(raw: unknown): ReviewPayload {
-    if (!isObject(raw)) {
-      throw new Error("Payload must be a JSON object.");
-    }
-    if (raw.schemaVersion !== 1) {
-      throw new Error("Only schemaVersion 1 is supported.");
-    }
-    if (typeof raw.notePath !== "string" || !raw.notePath.trim()) {
-      throw new Error("Payload notePath is required.");
-    }
-    if (typeof raw.baseHash !== "string" || !raw.baseHash.trim()) {
-      throw new Error("Payload baseHash is required.");
-    }
-    if (!isObject(raw.generator) || raw.generator.source !== "codex") {
-      throw new Error("Payload generator.source must be \"codex\".");
-    }
-    if (typeof raw.generator.generatedAt !== "string" || !raw.generator.generatedAt.trim()) {
-      throw new Error("Payload generator.generatedAt is required.");
-    }
-    if (!Array.isArray(raw.suggestions)) {
-      throw new Error("Payload suggestions must be an array.");
-    }
-
-    const now = new Date().toISOString();
-    const suggestions = raw.suggestions.map((item, index) => {
-      if (!isObject(item)) {
-        throw new Error(`Suggestion at index ${index} must be an object.`);
-      }
-      if (typeof item.start !== "number" || typeof item.end !== "number") {
-        throw new Error(`Suggestion at index ${index} must include numeric start/end.`);
-      }
-      if (item.start < 0 || item.end < item.start) {
-        throw new Error(`Suggestion at index ${index} has invalid offsets.`);
-      }
-      if (typeof item.expectedOldText !== "string" || typeof item.newText !== "string") {
-        throw new Error(`Suggestion at index ${index} must include text fields.`);
-      }
-      if (item.rationale !== undefined && typeof item.rationale !== "string") {
-        throw new Error(`Suggestion at index ${index} has invalid rationale.`);
-      }
-      if (item.id !== undefined && typeof item.id !== "string") {
-        throw new Error(`Suggestion at index ${index} has invalid id.`);
-      }
-      if (item.createdAt !== undefined && typeof item.createdAt !== "string") {
-        throw new Error(`Suggestion at index ${index} has invalid createdAt.`);
-      }
-
-      return {
-        id: item.id ?? `s-${index + 1}`,
-        start: item.start,
-        end: item.end,
-        expectedOldText: item.expectedOldText,
-        newText: item.newText,
-        rationale: item.rationale,
-        status: "pending",
-        createdAt: item.createdAt ?? now
-      } satisfies Suggestion;
-    });
-
-    return {
-      schemaVersion: 1,
-      notePath: raw.notePath,
-      baseHash: raw.baseHash,
-      generator: {
-        source: "codex",
-        model: typeof raw.generator.model === "string" ? raw.generator.model : undefined,
-        generatedAt: raw.generator.generatedAt
-      },
-      suggestions
-    };
-  }
-
-  private async pickJsonFile(): Promise<File | null> {
-    return await new Promise<File | null>((resolve) => {
-      const input = document.createElement("input");
-      input.type = "file";
-      input.accept = ".json,application/json";
-      input.onchange = () => {
-        resolve(input.files?.item(0) ?? null);
-      };
-      input.click();
-    });
   }
 
   private async createSelectionRequest(
@@ -728,43 +569,23 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private getActiveCodeMirrorView():
-    | { dispatch: (spec: unknown) => void }
+    | DispatchableCodeMirrorView
     | null {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view) {
       return null;
     }
 
-    const editor = view.editor as unknown as {
-      cm?: { dispatch: (spec: unknown) => void };
-      cm6?: { dispatch: (spec: unknown) => void };
-      editor?: { cm?: { dispatch: (spec: unknown) => void }; cm6?: { dispatch: (spec: unknown) => void } };
-    };
-    const markdownView = view as unknown as {
-      editor?: { cm?: { dispatch: (spec: unknown) => void }; cm6?: { dispatch: (spec: unknown) => void } };
-      editorCm?: { dispatch: (spec: unknown) => void };
-      cm?: { dispatch: (spec: unknown) => void };
-      cm6?: { dispatch: (spec: unknown) => void };
-      currentMode?: {
-        editor?: {
-          cm?: { dispatch: (spec: unknown) => void };
-          cm6?: { dispatch: (spec: unknown) => void };
-        };
-      };
-    };
-
     return (
-      editor.cm6 ??
-      editor.cm ??
-      editor.editor?.cm6 ??
-      editor.editor?.cm ??
-      markdownView.cm6 ??
-      markdownView.cm ??
-      markdownView.editorCm ??
-      markdownView.editor?.cm6 ??
-      markdownView.editor?.cm ??
-      markdownView.currentMode?.editor?.cm6 ??
-      markdownView.currentMode?.editor?.cm ??
+      readDispatchableCodeMirrorView(view, ["editor", "cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["editor", "cm"]) ??
+      readDispatchableCodeMirrorView(view, ["editor", "editor", "cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["editor", "editor", "cm"]) ??
+      readDispatchableCodeMirrorView(view, ["cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["cm"]) ??
+      readDispatchableCodeMirrorView(view, ["editorCm"]) ??
+      readDispatchableCodeMirrorView(view, ["currentMode", "editor", "cm6"]) ??
+      readDispatchableCodeMirrorView(view, ["currentMode", "editor", "cm"]) ??
       null
     );
   }
@@ -864,7 +685,8 @@ export default class AiReviewPlugin extends Plugin {
         response = parseCodexSelectionResponse(
           await this.persistence.readSelectionResponse(responseFile)
         );
-      } catch {
+      } catch (error) {
+        console.warn("AI Review skipped an unreadable Codex response.", responseFile, error);
         continue;
       }
 
@@ -1019,7 +841,7 @@ export default class AiReviewPlugin extends Plugin {
       return;
     }
     const normalizedFolder = nodePath.normalize(noteFolder);
-    if (this.isWatcherRunningForFolder(normalizedFolder)) {
+    if (this.detectExistingWatcherForFolder(normalizedFolder)) {
       return;
     }
 
@@ -1044,13 +866,10 @@ export default class AiReviewPlugin extends Plugin {
     const absoluteSchemaPath = nodePath.join(vaultBase, responseSchemaPath);
 
     try {
-      const childProcess = window.require("child_process") as {
-        spawn: (
-          command: string,
-          args: string[],
-          options?: { detached?: boolean; stdio?: string; windowsHide?: boolean }
-        ) => { unref?: () => void; pid?: number };
-      };
+      const childProcess = getNodeChildProcessModule();
+      if (!childProcess) {
+        throw new Error("child_process module is unavailable.");
+      }
       const child = childProcess.spawn(
         "cmd.exe",
         [
@@ -1085,43 +904,22 @@ export default class AiReviewPlugin extends Plugin {
         }
       );
       child.unref?.();
-      if (typeof child.pid === "number" && child.pid > 0) {
-        this.launchedWatcherPids.set(normalizedFolder, child.pid);
-      }
     } catch (error) {
       console.error("AI Review could not launch Codex terminal.", error);
       new Notice("AI Review could not auto-launch the Codex watcher. Check the Codex CLI command in settings.");
     }
   }
 
-  private isWatcherRunningForFolder(folderPath: string): boolean {
-    const pid = this.launchedWatcherPids.get(folderPath);
-    if (!pid) {
-      return this.detectExistingWatcherForFolder(folderPath);
-    }
-
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      this.launchedWatcherPids.delete(folderPath);
-      return this.detectExistingWatcherForFolder(folderPath);
-    }
-  }
-
   private detectExistingWatcherForFolder(folderPath: string): boolean {
-    if (process.platform !== "win32" || typeof window.require !== "function") {
+    if (process.platform !== "win32") {
       return false;
     }
 
     try {
-      const childProcess = window.require("child_process") as {
-        execFileSync: (
-          command: string,
-          args: string[],
-          options?: { encoding?: BufferEncoding; windowsHide?: boolean }
-        ) => string;
-      };
+      const childProcess = getNodeChildProcessModule();
+      if (!childProcess) {
+        return false;
+      }
       const escapedFolderPath = folderPath.replace(/'/g, "''");
       const script = [
         `$folder = '${escapedFolderPath}'`,
@@ -1146,29 +944,28 @@ export default class AiReviewPlugin extends Plugin {
 
   private resolveCodexCliCommand(): string | null {
     const configured = this.settings.codexCliCommand.trim();
-    const fs = window.require?.("fs") as { existsSync?: (path: string) => boolean } | undefined;
-    const existsSync = fs?.existsSync;
-    const candidates = [
-      configured,
-      configured ? `${configured}.cmd` : "",
-      configured ? `${configured}.ps1` : "",
-      process.env.APPDATA
-        ? nodePath.join(process.env.APPDATA, "npm", "codex.cmd")
-        : "",
-      process.env.APPDATA
-        ? nodePath.join(process.env.APPDATA, "npm", "codex.ps1")
-        : "",
-      "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe",
-      "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex"
-    ].filter((value) => Boolean(value));
+    const fs = getNodeFsModule();
+    if (configured) {
+      if (fs && nodePath.isAbsolute(configured) && fs.existsSync(configured)) {
+        return configured;
+      }
 
-    if (!existsSync) {
-      return configured || null;
+      const resolvedConfigured = findCommandOnPath(configured);
+      if (resolvedConfigured) {
+        return resolvedConfigured;
+      }
     }
 
-    for (const candidate of candidates) {
-      if (nodePath.isAbsolute(candidate) && existsSync(candidate)) {
+    for (const candidate of getBundledCodexCandidates()) {
+      if (fs?.existsSync(candidate)) {
         return candidate;
+      }
+    }
+
+    for (const candidate of ["codex.cmd", "codex.ps1", "codex"]) {
+      const resolvedCandidate = findCommandOnPath(candidate);
+      if (resolvedCandidate) {
+        return resolvedCandidate;
       }
     }
 
@@ -1176,11 +973,11 @@ export default class AiReviewPlugin extends Plugin {
   }
 
   private getVaultBasePath(): string | null {
-    const adapter = this.app.vault.adapter as { getBasePath?: () => string; basePath?: string };
-    if (typeof adapter.getBasePath === "function") {
+    const adapter = this.app.vault.adapter;
+    if (hasVaultBasePath(adapter) && typeof adapter.getBasePath === "function") {
       return adapter.getBasePath();
     }
-    if (typeof adapter.basePath === "string" && adapter.basePath.trim()) {
+    if (hasVaultBasePath(adapter) && typeof adapter.basePath === "string" && adapter.basePath.trim()) {
       return adapter.basePath;
     }
     return null;
@@ -1762,6 +1559,130 @@ class ReviewSuggestionModal extends Modal {
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function parseSettingsData(raw: unknown): Partial<AiReviewSettings> {
+  if (!isObject(raw)) {
+    return {};
+  }
+
+  const settings: Partial<AiReviewSettings> = {};
+  if (typeof raw.reviewsFolder === "string") {
+    settings.reviewsFolder = raw.reviewsFolder;
+  }
+  if (typeof raw.requestsFolder === "string") {
+    settings.requestsFolder = raw.requestsFolder;
+  }
+  if (typeof raw.responsesFolder === "string") {
+    settings.responsesFolder = raw.responsesFolder;
+  }
+  if (typeof raw.auditLogPath === "string") {
+    settings.auditLogPath = raw.auditLogPath;
+  }
+  if (typeof raw.reviewerName === "string") {
+    settings.reviewerName = raw.reviewerName;
+  }
+  if (typeof raw.defaultEditInstruction === "string") {
+    settings.defaultEditInstruction = raw.defaultEditInstruction;
+  }
+  if (typeof raw.autoLaunchCodex === "boolean") {
+    settings.autoLaunchCodex = raw.autoLaunchCodex;
+  }
+  if (typeof raw.codexCliCommand === "string") {
+    settings.codexCliCommand = raw.codexCliCommand;
+  }
+
+  return settings;
+}
+
+function getNodeModule(moduleName: string): unknown | null {
+  if (typeof window.require !== "function") {
+    return null;
+  }
+
+  try {
+    return window.require(moduleName);
+  } catch {
+    return null;
+  }
+}
+
+function isNodeChildProcessModule(value: unknown): value is NodeChildProcessModule {
+  return (
+    isObject(value) &&
+    typeof value.spawn === "function" &&
+    typeof value.execFileSync === "function"
+  );
+}
+
+function getNodeChildProcessModule(): NodeChildProcessModule | null {
+  const moduleValue = getNodeModule("child_process");
+  return isNodeChildProcessModule(moduleValue) ? moduleValue : null;
+}
+
+function findCommandOnPath(command: string): string | null {
+  const childProcess = getNodeChildProcessModule();
+  if (!childProcess || !command.trim()) {
+    return null;
+  }
+
+  try {
+    const output = childProcess.execFileSync("where.exe", [command], {
+      encoding: "utf8",
+      windowsHide: true
+    });
+    return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find((line) => line.length > 0) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function getBundledCodexCandidates(): string[] {
+  const candidates = [
+    process.env.APPDATA ? nodePath.join(process.env.APPDATA, "npm", "codex.cmd") : "",
+    process.env.APPDATA ? nodePath.join(process.env.APPDATA, "npm", "codex.ps1") : "",
+    "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex.exe",
+    "C:\\Program Files\\WindowsApps\\OpenAI.Codex_26.409.1734.0_x64__2p2nqsd0c76g0\\app\\resources\\codex"
+  ];
+
+  return candidates.filter((candidate) => candidate.length > 0);
+}
+
+function isNodeFsModule(value: unknown): value is NodeFsModule {
+  return isObject(value) && typeof value.existsSync === "function";
+}
+
+function getNodeFsModule(): NodeFsModule | null {
+  const moduleValue = getNodeModule("fs");
+  return isNodeFsModule(moduleValue) ? moduleValue : null;
+}
+
+function readDispatchableCodeMirrorView(
+  root: unknown,
+  path: string[]
+): DispatchableCodeMirrorView | null {
+  let current: unknown = root;
+  for (const key of path) {
+    if (!isObject(current)) {
+      return null;
+    }
+    current = current[key];
+  }
+
+  return isDispatchableCodeMirrorView(current) ? current : null;
+}
+
+function isDispatchableCodeMirrorView(value: unknown): value is DispatchableCodeMirrorView {
+  return isObject(value) && typeof value.dispatch === "function";
+}
+
+function hasVaultBasePath(
+  value: unknown
+): value is { getBasePath?: () => string; basePath?: string } {
+  return isObject(value);
 }
 
 function normalizeAiOutput(value: string): string {
