@@ -58,6 +58,9 @@ export interface AuditEvent {
   baseHash?: string;
   currentHash?: string;
   payloadGenerator?: string;
+  appliedCount?: number;
+  conflictedCount?: number;
+  rejectedCount?: number;
 }
 
 export interface AiReviewSettings {
@@ -71,4 +74,3 @@ export const DEFAULT_SETTINGS: AiReviewSettings = {
   auditLogPath: ".obsidian/ai-review/review-log.ndjson",
   reviewerName: ""
 };
-

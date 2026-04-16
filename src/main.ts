@@ -19,6 +19,7 @@ export default class AiReviewPlugin extends Plugin {
   persistence!: ReviewPersistence;
   currentReviewState: ReviewState | null = null;
   activeNotePath: string | null = null;
+  selectedSuggestionId: string | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -38,6 +39,64 @@ export default class AiReviewPlugin extends Plugin {
       name: "AI Review: Import suggestions from JSON",
       callback: async () => {
         await this.importSuggestionsFromJson();
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-next-suggestion",
+      name: "AI Review: Next suggestion",
+      callback: () => {
+        this.moveSuggestionSelection(1);
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-previous-suggestion",
+      name: "AI Review: Previous suggestion",
+      callback: () => {
+        this.moveSuggestionSelection(-1);
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-accept-current",
+      name: "AI Review: Accept current suggestion",
+      callback: async () => {
+        const suggestion = this.getCurrentPendingSuggestion();
+        if (!suggestion) {
+          new Notice("No pending suggestion selected.");
+          return;
+        }
+        await this.onSuggestionAction(suggestion.id, "accept");
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-reject-current",
+      name: "AI Review: Reject current suggestion",
+      callback: async () => {
+        const suggestion = this.getCurrentPendingSuggestion();
+        if (!suggestion) {
+          new Notice("No pending suggestion selected.");
+          return;
+        }
+        await this.onSuggestionAction(suggestion.id, "reject");
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-accept-all-pending",
+      name: "AI Review: Accept all pending",
+      callback: async () => {
+        await this.acceptAllPendingSuggestions();
+      }
+    });
+
+    this.addCommand({
+      id: "ai-review-reject-all-pending",
+      name: "AI Review: Reject all pending",
+      callback: async () => {
+        await this.rejectAllPendingSuggestions();
       }
     });
 
@@ -109,6 +168,7 @@ export default class AiReviewPlugin extends Plugin {
     const reviewFile = await this.persistence.writeReviewState(state);
     this.currentReviewState = state;
     this.activeNotePath = activePath;
+    this.selectedSuggestionId = this.currentReviewState.suggestions.find((item) => item.status === "pending")?.id ?? null;
     await this.persistence.appendAuditEvent({
       eventType: "import",
       notePath: activePath,
@@ -261,12 +321,15 @@ export default class AiReviewPlugin extends Plugin {
     if (!file) {
       this.currentReviewState = null;
       this.activeNotePath = null;
+      this.selectedSuggestionId = null;
       return;
     }
 
     const notePath = normalizePath(file.path);
     this.activeNotePath = notePath;
     this.currentReviewState = await this.persistence.readReviewState(notePath);
+    this.selectedSuggestionId =
+      this.currentReviewState?.suggestions.find((item) => item.status === "pending")?.id ?? null;
     this.refreshActiveEditorDecorations();
   }
 
@@ -301,10 +364,12 @@ export default class AiReviewPlugin extends Plugin {
 
     if (action === "reject") {
       await this.markSuggestionRejected(suggestion);
+      this.selectFallbackSuggestion();
       return;
     }
 
     await this.applySingleSuggestion(suggestion);
+    this.selectFallbackSuggestion();
   }
 
   private refreshActiveEditorDecorations(): void {
@@ -409,6 +474,171 @@ export default class AiReviewPlugin extends Plugin {
     });
     this.refreshActiveEditorDecorations();
     new Notice(`Accepted suggestion ${suggestion.id}.`);
+  }
+
+  private async acceptAllPendingSuggestions(): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      new Notice("No review state loaded for this note.");
+      return;
+    }
+    const file = this.getActiveMarkdownFile();
+    if (!file) {
+      new Notice("No active markdown file.");
+      return;
+    }
+
+    const pending = this.getPendingSuggestionsSorted();
+    if (pending.length === 0) {
+      new Notice("No pending suggestions.");
+      return;
+    }
+
+    const currentText = await this.app.vault.cachedRead(file);
+    const result = applySuggestionsDeterministically(currentText, pending);
+    const now = new Date().toISOString();
+    let appliedCount = 0;
+    let conflictedCount = 0;
+
+    for (const suggestion of pending) {
+      if (result.appliedIds.has(suggestion.id)) {
+        suggestion.status = "accepted";
+        suggestion.decidedAt = now;
+        suggestion.decidedBy = this.settings.reviewerName || undefined;
+        appliedCount += 1;
+      } else if (result.conflictedIds.has(suggestion.id)) {
+        suggestion.status = "conflict";
+        suggestion.decidedAt = now;
+        suggestion.decidedBy = this.settings.reviewerName || undefined;
+        conflictedCount += 1;
+      }
+    }
+
+    if (appliedCount > 0) {
+      await this.app.vault.modify(file, result.nextText);
+      this.currentReviewState.currentHash = sha256(result.nextText);
+    }
+    this.currentReviewState.updatedAt = now;
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "accept_all",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash,
+      appliedCount,
+      conflictedCount
+    });
+
+    this.selectFallbackSuggestion();
+    this.refreshActiveEditorDecorations();
+    new Notice(`Accepted ${appliedCount} suggestions. Conflicts: ${conflictedCount}.`);
+  }
+
+  private async rejectAllPendingSuggestions(): Promise<void> {
+    if (!this.currentReviewState || !this.activeNotePath) {
+      new Notice("No review state loaded for this note.");
+      return;
+    }
+    const pending = this.getPendingSuggestionsSorted();
+    if (pending.length === 0) {
+      new Notice("No pending suggestions.");
+      return;
+    }
+
+    const now = new Date().toISOString();
+    for (const suggestion of pending) {
+      suggestion.status = "rejected";
+      suggestion.decidedAt = now;
+      suggestion.decidedBy = this.settings.reviewerName || undefined;
+    }
+    this.currentReviewState.updatedAt = now;
+    const reviewFile = await this.persistence.writeReviewState(this.currentReviewState);
+    await this.persistence.appendAuditEvent({
+      eventType: "reject_all",
+      notePath: this.activeNotePath,
+      reviewFile,
+      timestamp: now,
+      reviewer: this.settings.reviewerName || undefined,
+      baseHash: this.currentReviewState.baseHash,
+      currentHash: this.currentReviewState.currentHash,
+      rejectedCount: pending.length
+    });
+
+    this.selectFallbackSuggestion();
+    this.refreshActiveEditorDecorations();
+    new Notice(`Rejected ${pending.length} suggestions.`);
+  }
+
+  private getPendingSuggestionsSorted(): Suggestion[] {
+    if (!this.currentReviewState) {
+      return [];
+    }
+    return this.currentReviewState.suggestions
+      .filter((suggestion) => suggestion.status === "pending")
+      .sort((a, b) => {
+        if (a.start !== b.start) {
+          return a.start - b.start;
+        }
+        return a.end - b.end;
+      });
+  }
+
+  private getCurrentPendingSuggestion(): Suggestion | null {
+    const pending = this.getPendingSuggestionsSorted();
+    if (pending.length === 0) {
+      return null;
+    }
+    if (!this.selectedSuggestionId) {
+      this.selectedSuggestionId = pending[0]?.id ?? null;
+      return pending[0] ?? null;
+    }
+    const selected = pending.find((item) => item.id === this.selectedSuggestionId);
+    if (selected) {
+      return selected;
+    }
+    this.selectedSuggestionId = pending[0]?.id ?? null;
+    return pending[0] ?? null;
+  }
+
+  private moveSuggestionSelection(direction: 1 | -1): void {
+    const pending = this.getPendingSuggestionsSorted();
+    if (pending.length === 0) {
+      new Notice("No pending suggestions.");
+      return;
+    }
+
+    const currentIndex = pending.findIndex((item) => item.id === this.selectedSuggestionId);
+    const baseIndex = currentIndex >= 0 ? currentIndex : 0;
+    const nextIndex = (baseIndex + direction + pending.length) % pending.length;
+    const next = pending[nextIndex];
+    if (!next) {
+      return;
+    }
+    this.selectedSuggestionId = next.id;
+    this.jumpToSuggestion(next);
+    this.refreshActiveEditorDecorations();
+    new Notice(`Selected suggestion ${next.id} (${nextIndex + 1}/${pending.length}).`);
+  }
+
+  private jumpToSuggestion(suggestion: Suggestion): void {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      return;
+    }
+    const editor = view.editor;
+    const pos = editor.offsetToPos(Math.max(0, suggestion.start));
+    editor.setCursor(pos);
+    editor.scrollIntoView({ from: pos, to: pos }, true);
+  }
+
+  private selectFallbackSuggestion(): void {
+    const next = this.getPendingSuggestionsSorted()[0];
+    this.selectedSuggestionId = next?.id ?? null;
+    if (next) {
+      this.jumpToSuggestion(next);
+    }
   }
 }
 
