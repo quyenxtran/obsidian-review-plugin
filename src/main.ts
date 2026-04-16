@@ -1673,7 +1673,7 @@ function buildCodexWatcherScript(): string {
     "  $tempOutputPath = Join-Path $ResponsesFolder \"$requestId.codex-output.json\"",
     "  $errorPath = Join-Path $ResponsesFolder \"$requestId.error.log\"",
     "",
-    "  if (Test-Path $donePath -or Test-Path $responsePath -or Test-Path $lockPath) {",
+    "  if ((Test-Path $donePath) -or (Test-Path $responsePath) -or (Test-Path $lockPath)) {",
     "    return",
     "  }",
     "",
